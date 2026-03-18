@@ -516,16 +516,9 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		if response.close {
 			res.Header().Set("Connection", "close")
 		}
-		flusher, _ := res.(http.Flusher)
 		res.WriteHeader(response.StatusCode)
-		// Flush the H2 HEADERS frame immediately so the client (e.g.
-		// Claude.exe) receives the response status without waiting for the
-		// first body write.  Without this, the 200 OK is only sent when
-		// copyStream makes its first res.Write call, which may be delayed
-		// by up to windowDuration in the SSE inspection path.
-		if flusher != nil {
-			flusher.Flush()
-		}
+
+		flusher, _ := res.(http.Flusher)
 
 		copyStream := func(r io.Reader) error {
 			if r == nil {
