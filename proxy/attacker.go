@@ -43,7 +43,6 @@ type attacker struct {
 	server   *http.Server
 	h2Server *http2.Server
 	client   *http.Client
-	h1Client *http.Client // H1.1-only upstream client used for H2 client connections
 	listener *attackerListener
 }
 
@@ -68,25 +67,6 @@ func newAttacker(proxy *Proxy) (*attacker, error) {
 			},
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				// 禁止自动重定向
-				return http.ErrUseLastResponse
-			},
-		},
-		// h1Client is used when the downstream client negotiated H2 but we
-		// want H1.1 on the upstream leg (lazy-attack path).  H1.1 has no
-		// GOAWAY frame, so long-lived SSE streams are never torn down by
-		// server-side connection rotation.  The standard http.Transport
-		// handles idle-connection cleanup and reconnection transparently.
-		h1Client: &http.Client{
-			Transport: &http.Transport{
-				Proxy:              proxy.realUpstreamProxy(),
-				ForceAttemptHTTP2:  false, // H1.1 only — no GOAWAY
-				DisableCompression: true,
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: proxy.Opts.SslInsecure,
-					KeyLogWriter:       helper.GetTlsKeyLogWriter(),
-				},
-			},
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		},
@@ -174,22 +154,51 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 			}
 		} else {
 			// Lazy path: the client negotiated H2 with our proxy but no server
-			// connection has been pre-established.  Use H1.1 on the upstream leg.
+			// connection has been pre-established.  Use H2 upstream so that the
+			// server sends response HEADERS immediately (before model generation
+			// starts), giving the downstream client its 200 OK early.
 			//
-			// H1.1 has no GOAWAY frame, so long-lived SSE streams (e.g. claude.ai
-			// /completion) are never torn down by server-side connection rotation.
-			// The standard http.Transport handles reconnection transparently when
-			// the server closes the connection between requests.
-			//
-			// This is a valid H2↔H1.1 bridge: the proxy terminates H2 from the
-			// client and re-issues each request over H1.1 to the server.
+			// GOAWAY is handled by retrying in attack() using the buffered request
+			// body (f.Request.Body []byte).
 			sni := connCtx.ClientConn.clientHello.ServerName
-			h1Client := a.h1Client
 			proxy := a.proxy
 			connCtx.dialFn = func(ctx context.Context) error {
 				serverConn := newServerConn()
 				serverConn.Address = sni
-				serverConn.client = h1Client
+				serverConn.client = &http.Client{
+					Transport: &http2.Transport{
+						DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+							fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
+							proxyURL, err := proxy.getUpstreamProxyUrl(fakeReq)
+							if err != nil {
+								return nil, err
+							}
+							var rawConn net.Conn
+							if proxyURL != nil {
+								rawConn, err = helper.GetProxyConn(ctx, proxyURL, addr, proxy.Opts.SslInsecure)
+							} else {
+								rawConn, err = (&net.Dialer{}).DialContext(ctx, network, addr)
+							}
+							if err != nil {
+								return nil, err
+							}
+							tlsConn := tls.Client(rawConn, cfg)
+							if err := tlsConn.HandshakeContext(ctx); err != nil {
+								rawConn.Close()
+								return nil, err
+							}
+							return tlsConn, nil
+						},
+						TLSClientConfig: &tls.Config{
+							InsecureSkipVerify: proxy.Opts.SslInsecure,
+							KeyLogWriter:       helper.GetTlsKeyLogWriter(),
+						},
+						DisableCompression: true,
+					},
+					CheckRedirect: func(req *http.Request, via []*http.Request) error {
+						return http.ErrUseLastResponse
+					},
+				}
 				connCtx.ServerConn = serverConn
 				for _, addon := range proxy.Addons {
 					addon.ServerConnected(connCtx)
@@ -675,6 +684,22 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 			}
 		}
 		proxyRes, err = f.ConnContext.ServerConn.client.Do(proxyReq)
+		// GOAWAY retry: the H2 upstream rotated its connection while our
+		// request was in-flight.  f.Request.Body is already buffered as []byte
+		// so we can re-issue on the fresh connection the transport opens.
+		if err != nil && !f.Stream && f.Request.Body != nil &&
+			strings.Contains(err.Error(), "GOAWAY") {
+			log.Infof("GOAWAY on upstream Do(), retrying: %v", err)
+			retryReq, e2 := http.NewRequestWithContext(proxyReqCtx, f.Request.Method, f.Request.URL.String(), bytes.NewReader(f.Request.Body))
+			if e2 == nil {
+				for key, value := range f.Request.Header {
+					for _, v := range value {
+						retryReq.Header.Add(key, v)
+					}
+				}
+				proxyRes, err = f.ConnContext.ServerConn.client.Do(retryReq)
+			}
+		}
 	}
 	if err != nil {
 		logErr(log, err)
