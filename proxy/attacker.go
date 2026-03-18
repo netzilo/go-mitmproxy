@@ -7,7 +7,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/lqqyt2423/go-mitmproxy/cert"
 	"github.com/lqqyt2423/go-mitmproxy/internal/helper"
@@ -104,10 +106,49 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 	connCtx.ClientConn.NegotiatedProtocol = clientTlsConn.ConnectionState().NegotiatedProtocol
 
 	if connCtx.ClientConn.NegotiatedProtocol == "h2" && connCtx.ServerConn != nil {
+		// firstDial tracks whether the initial cached tlsConn has been handed out.
+		// After a server GOAWAY the http2.Transport calls DialTLSContext again;
+		// we must return a genuinely fresh connection or the transport will keep
+		// retrying against the now-dead conn (causing ~5 s of 0 bytes then ctx cancel).
+		var dialMu sync.Mutex
+		firstDial := true
 		connCtx.ServerConn.client = &http.Client{
 			Transport: &http2.Transport{
 				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-					return connCtx.ServerConn.tlsConn, nil
+					dialMu.Lock()
+					first := firstDial
+					firstDial = false
+					dialMu.Unlock()
+
+					if first {
+						// Reuse the TLS connection that was already established
+						// during the CONNECT handshake.
+						return connCtx.ServerConn.tlsConn, nil
+					}
+
+					// Re-dial: the server sent GOAWAY (connection rotation after a
+					// long-lived SSE stream).  Establish a fresh TLS connection
+					// through the upstream proxy so the next request succeeds.
+					fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
+					proxyURL, err := a.proxy.getUpstreamProxyUrl(fakeReq)
+					if err != nil {
+						return nil, err
+					}
+					var rawConn net.Conn
+					if proxyURL != nil {
+						rawConn, err = helper.GetProxyConn(ctx, proxyURL, addr, a.proxy.Opts.SslInsecure)
+					} else {
+						rawConn, err = (&net.Dialer{}).DialContext(ctx, network, addr)
+					}
+					if err != nil {
+						return nil, err
+					}
+					tlsConn := tls.Client(rawConn, cfg)
+					if err := tlsConn.HandshakeContext(ctx); err != nil {
+						rawConn.Close()
+						return nil, err
+					}
+					return tlsConn, nil
 				},
 				DisableCompression: true,
 			},
