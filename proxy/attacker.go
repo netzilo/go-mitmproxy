@@ -578,7 +578,15 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		reqBody = addon.StreamRequestModifier(f, reqBody)
 	}
 
-	proxyReqCtx := context.WithValue(req.Context(), proxyReqCtxKey, req)
+	// Use a context independent of the downstream H2 stream context.
+	// When Claude.exe sends RST_STREAM after receiving a complete SSE response
+	// (normal H2 stream close), it cancels req.Context(), which would propagate
+	// to the upstream body reader and return context.Canceled instead of io.EOF.
+	// By using a fresh context we prevent that race; upstreamCancel fires via
+	// defer when the handler returns (after reply() finishes), so no leak.
+	upstreamCtx, upstreamCancel := context.WithCancel(context.Background())
+	defer upstreamCancel()
+	proxyReqCtx := context.WithValue(upstreamCtx, proxyReqCtxKey, req)
 	proxyReq, err := http.NewRequestWithContext(proxyReqCtx, f.Request.Method, f.Request.URL.String(), reqBody)
 	if err != nil {
 		for _, addon := range proxy.Addons {
