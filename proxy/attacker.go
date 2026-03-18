@@ -578,7 +578,16 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		reqBody = addon.StreamRequestModifier(f, reqBody)
 	}
 
-	proxyReqCtx := context.WithValue(req.Context(), proxyReqCtxKey, req)
+	upstreamCtx, upstreamCancel := context.WithCancel(context.Background())
+	defer upstreamCancel()
+	go func() {
+		select {
+		case <-req.Context().Done():
+			upstreamCancel()
+		case <-upstreamCtx.Done():
+		}
+	}()
+	proxyReqCtx := context.WithValue(upstreamCtx, proxyReqCtxKey, req)
 	proxyReq, err := http.NewRequestWithContext(proxyReqCtx, f.Request.Method, f.Request.URL.String(), reqBody)
 	if err != nil {
 		for _, addon := range proxy.Addons {
