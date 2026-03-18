@@ -528,6 +528,14 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		res.WriteHeader(response.StatusCode)
 
 		flusher, _ := res.(http.Flusher)
+		// Send the H2 HEADERS frame to the client immediately.  Without this
+		// flush, x/net/http2 delays the HEADERS frame until the first Write()
+		// call.  For SSE streams the first Write() may come 1+ seconds later
+		// (inspection window), by which time the client (e.g. Claude.exe) has
+		// already timed out waiting for any HTTP response.
+		if flusher != nil {
+			flusher.Flush()
+		}
 
 		copyStream := func(r io.Reader) error {
 			if r == nil {
