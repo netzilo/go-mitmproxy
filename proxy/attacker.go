@@ -435,7 +435,7 @@ func (a *attacker) httpsLazyAttack(ctx context.Context, cconn net.Conn, req *htt
 			return &tls.Config{
 				SessionTicketsDisabled: true,
 				Certificates:           []tls.Certificate{*c},
-				NextProtos:             []string{"http/1.1"}, // only support http/1.1
+				NextProtos:             []string{"h2", "http/1.1"},
 			}, nil
 		},
 	})
@@ -447,6 +447,19 @@ func (a *attacker) httpsLazyAttack(ctx context.Context, cconn net.Conn, req *htt
 
 	// will go to attacker.ServeHTTP
 	a.initHttpsDialFn(req)
+
+	// If the client negotiated H2, eagerly establish the server connection so
+	// that serveConn can install the http2.Transport with GOAWAY re-dial
+	// support. Without this, serveConn skips the H2 branch (ServerConn==nil)
+	// and falls back to H1, causing every server GOAWAY to kill the stream.
+	if clientTlsConn.ConnectionState().NegotiatedProtocol == "h2" {
+		if err := connCtx.dialFn(ctx); err != nil {
+			cconn.Close()
+			log.Error(err)
+			return
+		}
+	}
+
 	a.serveConn(clientTlsConn, connCtx)
 }
 
