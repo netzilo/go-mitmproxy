@@ -43,6 +43,7 @@ type attacker struct {
 	server   *http.Server
 	h2Server *http2.Server
 	client   *http.Client
+	h1Client *http.Client // H1.1-only upstream client used for H2 client connections
 	listener *attackerListener
 }
 
@@ -67,6 +68,25 @@ func newAttacker(proxy *Proxy) (*attacker, error) {
 			},
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				// 禁止自动重定向
+				return http.ErrUseLastResponse
+			},
+		},
+		// h1Client is used when the downstream client negotiated H2 but we
+		// want H1.1 on the upstream leg (lazy-attack path).  H1.1 has no
+		// GOAWAY frame, so long-lived SSE streams are never torn down by
+		// server-side connection rotation.  The standard http.Transport
+		// handles idle-connection cleanup and reconnection transparently.
+		h1Client: &http.Client{
+			Transport: &http.Transport{
+				Proxy:              proxy.realUpstreamProxy(),
+				ForceAttemptHTTP2:  false, // H1.1 only — no GOAWAY
+				DisableCompression: true,
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: proxy.Opts.SslInsecure,
+					KeyLogWriter:       helper.GetTlsKeyLogWriter(),
+				},
+			},
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		},
@@ -105,57 +125,77 @@ func (a *attacker) start() error {
 func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 	connCtx.ClientConn.NegotiatedProtocol = clientTlsConn.ConnectionState().NegotiatedProtocol
 
-	if connCtx.ClientConn.NegotiatedProtocol == "h2" && connCtx.ServerConn != nil {
-		// firstDial tracks whether the initial cached tlsConn has been handed out.
-		// After a server GOAWAY the http2.Transport calls DialTLSContext again;
-		// we must return a genuinely fresh connection or the transport will keep
-		// retrying against the now-dead conn (causing ~5 s of 0 bytes then ctx cancel).
-		var dialMu sync.Mutex
-		firstDial := true
-		connCtx.ServerConn.client = &http.Client{
-			Transport: &http2.Transport{
-				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-					dialMu.Lock()
-					first := firstDial
-					firstDial = false
-					dialMu.Unlock()
+	if connCtx.ClientConn.NegotiatedProtocol == "h2" {
+		if connCtx.ServerConn != nil {
+			// First-dial path (UpstreamCert mode): a real TLS connection to the
+			// server was established before the client handshake.  Use a bare
+			// http2.Transport so we get H2 multiplexing upstream, and install a
+			// DialTLSContext that re-dials a fresh connection after GOAWAY.
+			var dialMu sync.Mutex
+			firstDial := true
+			connCtx.ServerConn.client = &http.Client{
+				Transport: &http2.Transport{
+					DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+						dialMu.Lock()
+						first := firstDial
+						firstDial = false
+						dialMu.Unlock()
 
-					if first {
-						// Reuse the TLS connection that was already established
-						// during the CONNECT handshake.
-						return connCtx.ServerConn.tlsConn, nil
-					}
+						if first {
+							return connCtx.ServerConn.tlsConn, nil
+						}
 
-					// Re-dial: the server sent GOAWAY (connection rotation after a
-					// long-lived SSE stream).  Establish a fresh TLS connection
-					// through the upstream proxy so the next request succeeds.
-					fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
-					proxyURL, err := a.proxy.getUpstreamProxyUrl(fakeReq)
-					if err != nil {
-						return nil, err
-					}
-					var rawConn net.Conn
-					if proxyURL != nil {
-						rawConn, err = helper.GetProxyConn(ctx, proxyURL, addr, a.proxy.Opts.SslInsecure)
-					} else {
-						rawConn, err = (&net.Dialer{}).DialContext(ctx, network, addr)
-					}
-					if err != nil {
-						return nil, err
-					}
-					tlsConn := tls.Client(rawConn, cfg)
-					if err := tlsConn.HandshakeContext(ctx); err != nil {
-						rawConn.Close()
-						return nil, err
-					}
-					return tlsConn, nil
+						fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
+						proxyURL, err := a.proxy.getUpstreamProxyUrl(fakeReq)
+						if err != nil {
+							return nil, err
+						}
+						var rawConn net.Conn
+						if proxyURL != nil {
+							rawConn, err = helper.GetProxyConn(ctx, proxyURL, addr, a.proxy.Opts.SslInsecure)
+						} else {
+							rawConn, err = (&net.Dialer{}).DialContext(ctx, network, addr)
+						}
+						if err != nil {
+							return nil, err
+						}
+						tlsConn := tls.Client(rawConn, cfg)
+						if err := tlsConn.HandshakeContext(ctx); err != nil {
+							rawConn.Close()
+							return nil, err
+						}
+						return tlsConn, nil
+					},
+					DisableCompression: true,
 				},
-				DisableCompression: true,
-			},
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				// 禁止自动重定向
-				return http.ErrUseLastResponse
-			},
+				CheckRedirect: func(req *http.Request, via []*http.Request) error {
+					return http.ErrUseLastResponse
+				},
+			}
+		} else {
+			// Lazy path: the client negotiated H2 with our proxy but no server
+			// connection has been pre-established.  Use H1.1 on the upstream leg.
+			//
+			// H1.1 has no GOAWAY frame, so long-lived SSE streams (e.g. claude.ai
+			// /completion) are never torn down by server-side connection rotation.
+			// The standard http.Transport handles reconnection transparently when
+			// the server closes the connection between requests.
+			//
+			// This is a valid H2↔H1.1 bridge: the proxy terminates H2 from the
+			// client and re-issues each request over H1.1 to the server.
+			sni := connCtx.ClientConn.clientHello.ServerName
+			h1Client := a.h1Client
+			proxy := a.proxy
+			connCtx.dialFn = func(ctx context.Context) error {
+				serverConn := newServerConn()
+				serverConn.Address = sni
+				serverConn.client = h1Client
+				connCtx.ServerConn = serverConn
+				for _, addon := range proxy.Addons {
+					addon.ServerConnected(connCtx)
+				}
+				return nil
+			}
 		}
 
 		ctx := context.WithValue(context.Background(), connContextKey, connCtx)
@@ -445,19 +485,12 @@ func (a *attacker) httpsLazyAttack(ctx context.Context, cconn net.Conn, req *htt
 		return
 	}
 
-	// will go to attacker.ServeHTTP
-	a.initHttpsDialFn(req)
-
-	// If the client negotiated H2, eagerly establish the server connection so
-	// that serveConn can install the http2.Transport with GOAWAY re-dial
-	// support. Without this, serveConn skips the H2 branch (ServerConn==nil)
-	// and falls back to H1, causing every server GOAWAY to kill the stream.
-	if clientTlsConn.ConnectionState().NegotiatedProtocol == "h2" {
-		if err := connCtx.dialFn(ctx); err != nil {
-			cconn.Close()
-			log.Error(err)
-			return
-		}
+	// For H1.1 clients: set up the legacy server-side dial function (dial on
+	// first request, reuse the established TLS conn for subsequent ones).
+	// For H2 clients: serveConn installs a clean H1.1 upstream dial that
+	// avoids H2 GOAWAY killing SSE streams — no pre-dial needed.
+	if clientTlsConn.ConnectionState().NegotiatedProtocol != "h2" {
+		a.initHttpsDialFn(req)
 	}
 
 	a.serveConn(clientTlsConn, connCtx)
