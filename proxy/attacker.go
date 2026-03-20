@@ -547,6 +547,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 				n, err := r.Read(buf)
 				if n > 0 {
 					if _, werr := res.Write(buf[:n]); werr != nil {
+						log.Warnf("copyStream: client write failed: %v", werr)
 						return werr
 					}
 					flusher.Flush()
@@ -555,6 +556,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 					if err == io.EOF {
 						return nil
 					}
+					log.Warnf("copyStream: upstream read failed: %v", err)
 					return err
 				}
 			}
