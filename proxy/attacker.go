@@ -396,7 +396,11 @@ func (a *attacker) httpsTlsDial(ctx context.Context, cconn net.Conn, conn net.Co
 	errChan2 := make(chan error, 1)
 	clientHandshakeDoneChan := make(chan struct{})
 
-	clientTlsConn := tls.Server(cconn, &tls.Config{
+	// Chrome/Firefox send TLS 1.3 early data (0-RTT) when they have a cached
+	// session ticket from a previous proxy session. Go's crypto/tls hard-rejects
+	// this for non-QUIC connections with no way to configure it. Strip the
+	// early_data extension from the ClientHello bytes before Go sees them.
+	clientTlsConn := tls.Server(stripEarlyData(cconn), &tls.Config{
 		SessionTicketsDisabled: true, // 设置此值为 true ，确保每次都会调用下面的 GetConfigForClient 方法
 		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
 			clientHelloChan <- chi
@@ -473,7 +477,7 @@ func (a *attacker) httpsLazyAttack(ctx context.Context, cconn net.Conn, req *htt
 		"host": connCtx.ClientConn.Conn.RemoteAddr().String(),
 	})
 
-	clientTlsConn := tls.Server(cconn, &tls.Config{
+	clientTlsConn := tls.Server(stripEarlyData(cconn), &tls.Config{
 		SessionTicketsDisabled: true, // 设置此值为 true ，确保每次都会调用下面的 GetConfigForClient 方法
 		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
 			connCtx.ClientConn.clientHello = chi
