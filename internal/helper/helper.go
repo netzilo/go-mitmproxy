@@ -27,7 +27,7 @@ func ReaderToBuffer(r io.Reader, limit int64) ([]byte, io.Reader, error) {
 	// 达到上限
 	if int64(buf.Len()) == limit {
 		// 返回新的 Reader
-		return nil, io.MultiReader(bytes.NewBuffer(buf.Bytes()), r), nil
+		return nil, io.MultiReader(buf, r), nil
 	}
 
 	// 返回 buffer
