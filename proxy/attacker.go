@@ -293,11 +293,28 @@ func (a *attacker) serverTlsHandshake(ctx context.Context, connCtx *ConnContext)
 	clientHello := connCtx.ClientConn.clientHello
 	serverConn := connCtx.ServerConn
 
+	// When the client negotiated HTTP/1.1 with us, don't offer h2 to the upstream.
+	// If we do, the server may negotiate h2 but serverConn.client uses http.Transport
+	// which reads h2 SETTINGS frames as HTTP/1.1 → "malformed HTTP response".
+	nextProtos := clientHello.SupportedProtos
+	if connCtx.ClientConn.NegotiatedProtocol == "http/1.1" {
+		filtered := nextProtos[:0:0]
+		for _, p := range nextProtos {
+			if p != "h2" {
+				filtered = append(filtered, p)
+			}
+		}
+		if len(filtered) == 0 {
+			filtered = []string{"http/1.1"}
+		}
+		nextProtos = filtered
+	}
+
 	serverTlsConfig := &tls.Config{
 		InsecureSkipVerify: proxy.Opts.SslInsecure,
 		KeyLogWriter:       helper.GetTlsKeyLogWriter(),
 		ServerName:         clientHello.ServerName,
-		NextProtos:         clientHello.SupportedProtos,
+		NextProtos:         nextProtos,
 		// CurvePreferences:   clientHello.SupportedCurves, // todo: 如果打开会出错
 		CipherSuites: clientHello.CipherSuites,
 	}
@@ -326,12 +343,13 @@ func (a *attacker) serverTlsHandshake(ctx context.Context, connCtx *ConnContext)
 		addon.TlsEstablishedServer(connCtx)
 	}
 
+	forceH2 := serverTlsState.NegotiatedProtocol == "h2"
 	serverConn.client = &http.Client{
 		Transport: &http.Transport{
 			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return serverTlsConn, nil
 			},
-			ForceAttemptHTTP2:  true,
+			ForceAttemptHTTP2:  forceH2,
 			DisableCompression: true, // To get the original response from the server, set Transport.DisableCompression to true.
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
