@@ -13,6 +13,14 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// UpstreamTLSDialFunc creates a TLS connection to the upstream server.
+// rawConn is the already-connected TCP connection; config carries SNI, cipher
+// suites, and other TLS parameters derived from the intercepted ClientHello.
+// The function must perform the TLS handshake and return the established
+// connection together with its ConnectionState (needed for ALPN negotiation).
+// If nil, the standard crypto/tls stack is used.
+type UpstreamTLSDialFunc func(ctx context.Context, rawConn net.Conn, config *tls.Config) (net.Conn, *tls.ConnectionState, error)
+
 type Options struct {
 	Debug             int
 	Addr              string
@@ -22,6 +30,12 @@ type Options struct {
 	NewCaFunc         func() (cert.CA, error) //创建 Ca 的函数
 	Upstream          string
 	LogFilePath       string // Path to write logs to file
+
+	// UpstreamTLSDial, when set, is used for every TLS handshake toward the
+	// upstream server instead of the standard crypto/tls dialer.  Use this to
+	// install a browser-impersonating TLS stack (e.g. uTLS) to avoid JA3/JA4
+	// fingerprint-based detection by CDNs such as Cloudflare.
+	UpstreamTLSDial UpstreamTLSDialFunc
 }
 
 type Proxy struct {

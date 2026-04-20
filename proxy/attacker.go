@@ -139,12 +139,12 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 						if err != nil {
 							return nil, err
 						}
-						tlsConn := tls.Client(rawConn, cfg)
-						if err := tlsConn.HandshakeContext(ctx); err != nil {
+						conn, _, err := a.tlsDial(ctx, rawConn, cfg)
+						if err != nil {
 							rawConn.Close()
 							return nil, err
 						}
-						return tlsConn, nil
+						return conn, nil
 					},
 					DisableCompression: true,
 				},
@@ -182,12 +182,23 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 							if err != nil {
 								return nil, err
 							}
-							tlsConn := tls.Client(rawConn, cfg)
-							if err := tlsConn.HandshakeContext(ctx); err != nil {
-								rawConn.Close()
-								return nil, err
+							var (
+								conn net.Conn
+								err2 error
+							)
+							if fn := proxy.Opts.UpstreamTLSDial; fn != nil {
+								conn, _, err2 = fn(ctx, rawConn, cfg)
+							} else {
+								c := tls.Client(rawConn, cfg)
+								if err2 = c.HandshakeContext(ctx); err2 == nil {
+									conn = c
+								}
 							}
-							return tlsConn, nil
+							if err2 != nil {
+								rawConn.Close()
+								return nil, err2
+							}
+							return conn, nil
 						},
 						TLSClientConfig: &tls.Config{
 							InsecureSkipVerify: proxy.Opts.SslInsecure,
@@ -287,6 +298,21 @@ func (a *attacker) initHttpDialFn(req *http.Request) {
 	}
 }
 
+// tlsDial performs a TLS handshake on rawConn using either the proxy's
+// UpstreamTLSDial hook (e.g. uTLS browser impersonation) or the standard
+// crypto/tls stack.  It returns the established connection and its state.
+func (a *attacker) tlsDial(ctx context.Context, rawConn net.Conn, cfg *tls.Config) (net.Conn, *tls.ConnectionState, error) {
+	if fn := a.proxy.Opts.UpstreamTLSDial; fn != nil {
+		return fn(ctx, rawConn, cfg)
+	}
+	c := tls.Client(rawConn, cfg)
+	if err := c.HandshakeContext(ctx); err != nil {
+		return nil, nil, err
+	}
+	st := c.ConnectionState()
+	return c, &st, nil
+}
+
 // send clientHello to server, server handshake
 func (a *attacker) serverTlsHandshake(ctx context.Context, connCtx *ConnContext) error {
 	proxy := a.proxy
@@ -315,13 +341,12 @@ func (a *attacker) serverTlsHandshake(ctx context.Context, connCtx *ConnContext)
 		serverTlsConfig.MinVersion = minVersion
 		serverTlsConfig.MaxVersion = maxVersion
 	}
-	serverTlsConn := tls.Client(serverConn.Conn, serverTlsConfig)
-	serverConn.tlsConn = serverTlsConn
-	if err := serverTlsConn.HandshakeContext(ctx); err != nil {
+	tlsConn, tlsState, err := a.tlsDial(ctx, serverConn.Conn, serverTlsConfig)
+	if err != nil {
 		return err
 	}
-	serverTlsState := serverTlsConn.ConnectionState()
-	serverConn.tlsState = &serverTlsState
+	serverConn.tlsConn = tlsConn
+	serverConn.tlsState = tlsState
 	for _, addon := range proxy.Addons {
 		addon.TlsEstablishedServer(connCtx)
 	}
@@ -329,7 +354,7 @@ func (a *attacker) serverTlsHandshake(ctx context.Context, connCtx *ConnContext)
 	serverConn.client = &http.Client{
 		Transport: &http.Transport{
 			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return serverTlsConn, nil
+				return serverConn.tlsConn, nil
 			},
 			ForceAttemptHTTP2:  true,
 			DisableCompression: true, // To get the original response from the server, set Transport.DisableCompression to true.
