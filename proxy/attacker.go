@@ -344,10 +344,41 @@ func (a *attacker) serverTlsHandshake(ctx context.Context, connCtx *ConnContext)
 	}
 
 	forceH2 := serverTlsState.NegotiatedProtocol == "h2"
+	var (
+		dialMu    sync.Mutex
+		firstDial = true
+	)
 	serverConn.client = &http.Client{
 		Transport: &http.Transport{
 			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return serverTlsConn, nil
+				dialMu.Lock()
+				first := firstDial
+				firstDial = false
+				dialMu.Unlock()
+				if first {
+					return serverTlsConn, nil
+				}
+				// Reconnect: previous TLS conn is exhausted; dial fresh upstream connection.
+				fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
+				proxyURL, err := proxy.getUpstreamProxyUrl(fakeReq)
+				if err != nil {
+					return nil, err
+				}
+				var rawConn net.Conn
+				if proxyURL != nil {
+					rawConn, err = helper.GetProxyConn(ctx, proxyURL, addr, proxy.Opts.SslInsecure)
+				} else {
+					rawConn, err = (&net.Dialer{}).DialContext(ctx, network, addr)
+				}
+				if err != nil {
+					return nil, err
+				}
+				freshTls := tls.Client(rawConn, serverTlsConfig.Clone())
+				if err := freshTls.HandshakeContext(ctx); err != nil {
+					rawConn.Close()
+					return nil, err
+				}
+				return freshTls, nil
 			},
 			ForceAttemptHTTP2:  forceH2,
 			DisableCompression: true, // To get the original response from the server, set Transport.DisableCompression to true.
