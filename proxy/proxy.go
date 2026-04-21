@@ -34,6 +34,7 @@ type Proxy struct {
 	webSocketHandler *webSocketHandler
 	shouldIntercept  func(req *http.Request) bool              // req is received by proxy.server
 	upstreamProxy    func(req *http.Request) (*url.URL, error) // req is received by proxy.server, not client request
+	upstreamDialer   func(ctx context.Context, network, addr string) (net.Conn, error)
 	authProxy        func(res http.ResponseWriter, req *http.Request) (bool, error)
 }
 
@@ -101,6 +102,31 @@ func (proxy *Proxy) SetUpstreamProxy(fn func(req *http.Request) (*url.URL, error
 	proxy.upstreamProxy = fn
 }
 
+// SetUpstreamDialer registers a custom dialer for all upstream TCP connections.
+// When set it takes precedence over SetUpstreamProxy: the dialer is called
+// directly without going through a CONNECT proxy, eliminating the per-connection
+// goroutine overhead of the bridge listener approach.
+func (proxy *Proxy) SetUpstreamDialer(fn func(ctx context.Context, network, addr string) (net.Conn, error)) {
+	proxy.upstreamDialer = fn
+}
+
+// dialRawConn opens a plain TCP connection to addr. If an upstream dialer was
+// registered via SetUpstreamDialer it is used directly; otherwise the
+// configured upstream proxy (or OS dialer) is used.
+func (proxy *Proxy) dialRawConn(ctx context.Context, network, addr string, req *http.Request) (net.Conn, error) {
+	if proxy.upstreamDialer != nil {
+		return proxy.upstreamDialer(ctx, network, addr)
+	}
+	proxyURL, err := proxy.getUpstreamProxyUrl(req)
+	if err != nil {
+		return nil, err
+	}
+	if proxyURL != nil {
+		return helper.GetProxyConn(ctx, proxyURL, addr, proxy.Opts.SslInsecure)
+	}
+	return (&net.Dialer{}).DialContext(ctx, network, addr)
+}
+
 func (proxy *Proxy) realUpstreamProxy() func(*http.Request) (*url.URL, error) {
 	return func(cReq *http.Request) (*url.URL, error) {
 		req := cReq.Context().Value(proxyReqCtxKey).(*http.Request)
@@ -120,18 +146,8 @@ func (proxy *Proxy) getUpstreamProxyUrl(req *http.Request) (*url.URL, error) {
 }
 
 func (proxy *Proxy) getUpstreamConn(ctx context.Context, req *http.Request) (net.Conn, error) {
-	proxyUrl, err := proxy.getUpstreamProxyUrl(req)
-	if err != nil {
-		return nil, err
-	}
-	var conn net.Conn
 	address := helper.CanonicalAddr(req.URL)
-	if proxyUrl != nil {
-		conn, err = helper.GetProxyConn(ctx, proxyUrl, address, proxy.Opts.SslInsecure)
-	} else {
-		conn, err = (&net.Dialer{}).DialContext(ctx, "tcp", address)
-	}
-	return conn, err
+	return proxy.dialRawConn(ctx, "tcp", address, req)
 }
 
 func (proxy *Proxy) SetAuthProxy(fn func(res http.ResponseWriter, req *http.Request) (bool, error)) {

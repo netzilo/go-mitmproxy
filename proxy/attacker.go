@@ -57,7 +57,20 @@ func newAttacker(proxy *Proxy) (*attacker, error) {
 		ca:    ca,
 		client: &http.Client{
 			Transport: &http.Transport{
-				Proxy:              proxy.realUpstreamProxy(),
+				// When upstreamDialer is set use it directly (no CONNECT proxy overhead);
+				// otherwise fall back to the configured upstream proxy.
+				Proxy: func(req *http.Request) (*url.URL, error) {
+					if proxy.upstreamDialer != nil {
+						return nil, nil
+					}
+					return proxy.realUpstreamProxy()(req)
+				},
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					if proxy.upstreamDialer != nil {
+						return proxy.upstreamDialer(ctx, network, addr)
+					}
+					return (&net.Dialer{}).DialContext(ctx, network, addr)
+				},
 				ForceAttemptHTTP2:  true,
 				DisableCompression: true, // To get the original response from the server, set Transport.DisableCompression to true.
 				TLSClientConfig: &tls.Config{
@@ -126,16 +139,7 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 						}
 
 						fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
-						proxyURL, err := a.proxy.getUpstreamProxyUrl(fakeReq)
-						if err != nil {
-							return nil, err
-						}
-						var rawConn net.Conn
-						if proxyURL != nil {
-							rawConn, err = helper.GetProxyConn(ctx, proxyURL, addr, a.proxy.Opts.SslInsecure)
-						} else {
-							rawConn, err = (&net.Dialer{}).DialContext(ctx, network, addr)
-						}
+						rawConn, err := a.proxy.dialRawConn(ctx, network, addr, fakeReq)
 						if err != nil {
 							return nil, err
 						}
@@ -169,16 +173,7 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 					Transport: &http2.Transport{
 						DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
 							fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
-							proxyURL, err := proxy.getUpstreamProxyUrl(fakeReq)
-							if err != nil {
-								return nil, err
-							}
-							var rawConn net.Conn
-							if proxyURL != nil {
-								rawConn, err = helper.GetProxyConn(ctx, proxyURL, addr, proxy.Opts.SslInsecure)
-							} else {
-								rawConn, err = (&net.Dialer{}).DialContext(ctx, network, addr)
-							}
+							rawConn, err := proxy.dialRawConn(ctx, network, addr, fakeReq)
 							if err != nil {
 								return nil, err
 							}
@@ -360,16 +355,7 @@ func (a *attacker) serverTlsHandshake(ctx context.Context, connCtx *ConnContext)
 				}
 				// Reconnect: previous TLS conn is exhausted; dial fresh upstream connection.
 				fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
-				proxyURL, err := proxy.getUpstreamProxyUrl(fakeReq)
-				if err != nil {
-					return nil, err
-				}
-				var rawConn net.Conn
-				if proxyURL != nil {
-					rawConn, err = helper.GetProxyConn(ctx, proxyURL, addr, proxy.Opts.SslInsecure)
-				} else {
-					rawConn, err = (&net.Dialer{}).DialContext(ctx, network, addr)
-				}
+				rawConn, err := proxy.dialRawConn(ctx, network, addr, fakeReq)
 				if err != nil {
 					return nil, err
 				}
