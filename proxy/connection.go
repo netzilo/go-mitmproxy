@@ -45,7 +45,7 @@ type ServerConn struct {
 	Conn    net.Conn
 
 	client   *http.Client
-	tlsConn  *tls.Conn
+	tlsConn  net.Conn // *chromeTLSConn; net.Conn is sufficient (returned as net.Conn in DialTLSContext)
 	tlsState *tls.ConnectionState
 }
 

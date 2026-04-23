@@ -72,7 +72,7 @@ func newAttacker(proxy *Proxy) (*attacker, error) {
 					return (&net.Dialer{}).DialContext(ctx, network, addr)
 				},
 				ForceAttemptHTTP2:  true,
-				DisableCompression: true, // To get the original response from the server, set Transport.DisableCompression to true.
+				DisableCompression: true,
 				TLSClientConfig: &tls.Config{
 					InsecureSkipVerify: proxy.Opts.SslInsecure,
 					KeyLogWriter:       helper.GetTlsKeyLogWriter(),
@@ -143,14 +143,16 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 						if err != nil {
 							return nil, err
 						}
-						tlsConn := tls.Client(rawConn, cfg)
-						if err := tlsConn.HandshakeContext(ctx); err != nil {
+						conn, err := chromeTLSDial(ctx, rawConn, cfg)
+						if err != nil {
 							rawConn.Close()
 							return nil, err
 						}
-						return tlsConn, nil
+						return conn, nil
 					},
-					DisableCompression: true,
+					DisableCompression:        true,
+					MaxHeaderListSize:         262144, // Chrome SETTINGS_MAX_HEADER_LIST_SIZE
+					MaxDecoderHeaderTableSize: 65536,  // Chrome SETTINGS_HEADER_TABLE_SIZE
 				},
 				CheckRedirect: func(req *http.Request, via []*http.Request) error {
 					return http.ErrUseLastResponse
@@ -177,18 +179,22 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 							if err != nil {
 								return nil, err
 							}
-							tlsConn := tls.Client(rawConn, cfg)
-							if err := tlsConn.HandshakeContext(ctx); err != nil {
-								rawConn.Close()
-								return nil, err
-							}
-							return tlsConn, nil
-						},
+							conn, err := chromeTLSDial(ctx, rawConn, cfg)
+						if err != nil {
+							rawConn.Close()
+							return nil, err
+						}
+						return conn, nil
+					},
+					// TLSClientConfig is the source for cfg passed to DialTLSContext above;
+						// chromeTLSDial reads InsecureSkipVerify and KeyLogWriter from it.
 						TLSClientConfig: &tls.Config{
 							InsecureSkipVerify: proxy.Opts.SslInsecure,
 							KeyLogWriter:       helper.GetTlsKeyLogWriter(),
 						},
-						DisableCompression: true,
+						DisableCompression:        true,
+						MaxHeaderListSize:         262144, // Chrome SETTINGS_MAX_HEADER_LIST_SIZE
+						MaxDecoderHeaderTableSize: 65536,  // Chrome SETTINGS_HEADER_TABLE_SIZE
 					},
 					CheckRedirect: func(req *http.Request, via []*http.Request) error {
 						return http.ErrUseLastResponse
@@ -327,18 +333,17 @@ func (a *attacker) serverTlsHandshake(ctx context.Context, connCtx *ConnContext)
 		serverTlsConfig.MinVersion = minVersion
 		serverTlsConfig.MaxVersion = maxVersion
 	}
-	serverTlsConn := tls.Client(serverConn.Conn, serverTlsConfig)
-	serverConn.tlsConn = serverTlsConn
-	if err := serverTlsConn.HandshakeContext(ctx); err != nil {
+	serverTlsConn, err := chromeTLSDial(ctx, serverConn.Conn, serverTlsConfig)
+	if err != nil {
 		return err
 	}
+	serverConn.tlsConn = serverTlsConn
 	serverTlsState := serverTlsConn.ConnectionState()
 	serverConn.tlsState = &serverTlsState
 	for _, addon := range proxy.Addons {
 		addon.TlsEstablishedServer(connCtx)
 	}
 
-	forceH2 := serverTlsState.NegotiatedProtocol == "h2"
 	var (
 		dialMu    sync.Mutex
 		firstDial = true
@@ -359,14 +364,14 @@ func (a *attacker) serverTlsHandshake(ctx context.Context, connCtx *ConnContext)
 				if err != nil {
 					return nil, err
 				}
-				freshTls := tls.Client(rawConn, serverTlsConfig.Clone())
-				if err := freshTls.HandshakeContext(ctx); err != nil {
+				freshTls, err := chromeTLSDial(ctx, rawConn, serverTlsConfig.Clone())
+				if err != nil {
 					rawConn.Close()
 					return nil, err
 				}
 				return freshTls, nil
 			},
-			ForceAttemptHTTP2:  forceH2,
+			ForceAttemptHTTP2:  false, // serveConn replaces this transport for h2 clients; for http/1.1 clients http.Transport cannot alt-proto-upgrade a *chromeTLSConn
 			DisableCompression: true, // To get the original response from the server, set Transport.DisableCompression to true.
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
