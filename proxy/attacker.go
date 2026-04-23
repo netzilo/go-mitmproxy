@@ -188,9 +188,13 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 					},
 					// TLSClientConfig is the source for cfg passed to DialTLSContext above;
 						// chromeTLSDial reads InsecureSkipVerify and KeyLogWriter from it.
+						// NextProtos must include "h2" so cfg.NextProtos is non-empty when
+						// chromeTLSDial evaluates it; without this it falls back to ["http/1.1"]
+						// and the upstream negotiates HTTP/1.1 instead of h2.
 						TLSClientConfig: &tls.Config{
 							InsecureSkipVerify: proxy.Opts.SslInsecure,
 							KeyLogWriter:       helper.GetTlsKeyLogWriter(),
+							NextProtos:         []string{"h2"},
 						},
 						DisableCompression:        true,
 						MaxHeaderListSize:         262144, // Chrome SETTINGS_MAX_HEADER_LIST_SIZE

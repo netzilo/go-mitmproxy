@@ -124,8 +124,11 @@ func (c *wrapServerConn) Close() error {
 	if !c.connCtx.ClientConn.Tls {
 		c.connCtx.ClientConn.Conn.(*wrapClientConn).Conn.(*net.TCPConn).CloseRead()
 	} else {
-		// if keep-alive connection close
-		if !c.connCtx.closeAfterResponse {
+		// For h2 clients the upstream connection is managed by http2.Transport
+		// which reconnects via DialTLSContext/reconnectFn.  Closing the client
+		// connection here fires closeChan, cancels all stream contexts, and kills
+		// in-flight requests before reconnection can complete.
+		if !c.connCtx.closeAfterResponse && c.connCtx.ClientConn.NegotiatedProtocol != "h2" {
 			c.connCtx.ClientConn.Conn.Close()
 		}
 	}
