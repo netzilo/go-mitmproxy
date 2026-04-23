@@ -348,36 +348,66 @@ func (a *attacker) serverTlsHandshake(ctx context.Context, connCtx *ConnContext)
 		dialMu    sync.Mutex
 		firstDial = true
 	)
-	serverConn.client = &http.Client{
-		Transport: &http.Transport{
-			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				dialMu.Lock()
-				first := firstDial
-				firstDial = false
-				dialMu.Unlock()
-				if first {
-					return serverTlsConn, nil
-				}
-				// Reconnect: previous TLS conn is exhausted; dial fresh upstream connection.
-				fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
-				rawConn, err := proxy.dialRawConn(ctx, network, addr, fakeReq)
-				if err != nil {
-					return nil, err
-				}
-				freshTls, err := chromeTLSDial(ctx, rawConn, serverTlsConfig.Clone())
-				if err != nil {
-					rawConn.Close()
-					return nil, err
-				}
-				return freshTls, nil
+	reconnectFn := func(ctx context.Context, addr string) (net.Conn, error) {
+		fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
+		rawConn, err := proxy.dialRawConn(ctx, "tcp", addr, fakeReq)
+		if err != nil {
+			return nil, err
+		}
+		freshTls, err := chromeTLSDial(ctx, rawConn, serverTlsConfig.Clone())
+		if err != nil {
+			rawConn.Close()
+			return nil, err
+		}
+		return freshTls, nil
+	}
+
+	checkRedirect := func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	if serverTlsState.NegotiatedProtocol == "h2" {
+		// Server negotiated h2: use http2.Transport directly.
+		// For h2 clients serveConn will replace this transport (firstDial not
+		// consumed yet so serverTlsConn stays fresh). For http/1.1 clients this
+		// transport is used as-is — http.Transport cannot alt-proto-upgrade a
+		// *chromeTLSConn so we must own the h2 framing ourselves.
+		serverConn.client = &http.Client{
+			Transport: &http2.Transport{
+				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+					dialMu.Lock()
+					first := firstDial
+					firstDial = false
+					dialMu.Unlock()
+					if first {
+						return serverTlsConn, nil
+					}
+					return reconnectFn(ctx, addr)
+				},
+				DisableCompression:        true,
+				MaxHeaderListSize:         262144,
+				MaxDecoderHeaderTableSize: 65536,
 			},
-			ForceAttemptHTTP2:  false, // serveConn replaces this transport for h2 clients; for http/1.1 clients http.Transport cannot alt-proto-upgrade a *chromeTLSConn
-			DisableCompression: true, // To get the original response from the server, set Transport.DisableCompression to true.
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// 禁止自动重定向
-			return http.ErrUseLastResponse
-		},
+			CheckRedirect: checkRedirect,
+		}
+	} else {
+		serverConn.client = &http.Client{
+			Transport: &http.Transport{
+				DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					dialMu.Lock()
+					first := firstDial
+					firstDial = false
+					dialMu.Unlock()
+					if first {
+						return serverTlsConn, nil
+					}
+					return reconnectFn(ctx, addr)
+				},
+				ForceAttemptHTTP2:  false,
+				DisableCompression: true,
+			},
+			CheckRedirect: checkRedirect,
+		}
 	}
 
 	return nil
