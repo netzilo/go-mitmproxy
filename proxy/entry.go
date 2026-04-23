@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"sync"
 
 	"github.com/lqqyt2423/go-mitmproxy/internal/helper"
@@ -76,7 +77,10 @@ func (c *wrapClientConn) Close() error {
 		c.closeMu.Unlock()
 		return c.closeErr
 	}
-	log.Debugln("in wrapClientConn close", c.connCtx.ClientConn.Conn.RemoteAddr())
+	log.Debugf("in wrapClientConn close %v proto=%q stack:\n%s",
+		c.connCtx.ClientConn.Conn.RemoteAddr(),
+		c.connCtx.ClientConn.NegotiatedProtocol,
+		debug.Stack())
 
 	c.closed = true
 	c.closeErr = c.Conn.Close()
@@ -124,8 +128,11 @@ func (c *wrapServerConn) Close() error {
 	if !c.connCtx.ClientConn.Tls {
 		c.connCtx.ClientConn.Conn.(*wrapClientConn).Conn.(*net.TCPConn).CloseRead()
 	} else {
-		// if keep-alive connection close
-		if !c.connCtx.closeAfterResponse {
+		// For h2 clients the upstream connection is managed by http2.Transport
+		// which reconnects via DialTLSContext/reconnectFn.  Closing the client
+		// connection here fires closeChan, cancels all stream contexts, and kills
+		// in-flight requests before reconnection can complete.
+		if !c.connCtx.closeAfterResponse && c.connCtx.ClientConn.NegotiatedProtocol != "h2" {
 			c.connCtx.ClientConn.Conn.Close()
 		}
 	}
