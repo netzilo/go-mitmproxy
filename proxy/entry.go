@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"runtime/debug"
 	"sync"
 
 	"github.com/lqqyt2423/go-mitmproxy/internal/helper"
@@ -77,10 +76,7 @@ func (c *wrapClientConn) Close() error {
 		c.closeMu.Unlock()
 		return c.closeErr
 	}
-	log.Debugf("in wrapClientConn close %v proto=%q stack:\n%s",
-		c.connCtx.ClientConn.Conn.RemoteAddr(),
-		c.connCtx.ClientConn.NegotiatedProtocol,
-		debug.Stack())
+	log.Debugln("in wrapClientConn close", c.connCtx.ClientConn.Conn.RemoteAddr())
 
 	c.closed = true
 	c.closeErr = c.Conn.Close()
