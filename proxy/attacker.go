@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/lqqyt2423/go-mitmproxy/cert"
 	"github.com/lqqyt2423/go-mitmproxy/internal/helper"
@@ -179,12 +180,69 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 			// body (f.Request.Body []byte).
 			sni := connCtx.ClientConn.clientHello.ServerName
 			proxy := a.proxy
+
+			// Pre-dial: start TCP+TLS to the upstream server immediately so the
+			// connection is ready when the first request arrives, avoiding serial
+			// latency that causes Cursor to RST_STREAM before getting a response.
+			type preDialResult struct {
+				conn net.Conn
+				err  error
+			}
+			preDialCh := make(chan preDialResult, 1)
+			go func() {
+				addr := sni + ":443"
+				fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
+				rawConn, err := proxy.dialRawConn(sessionCtx, "tcp", addr, fakeReq)
+				if err != nil {
+					preDialCh <- preDialResult{err: err}
+					return
+				}
+				tlsCfg := &tls.Config{
+					InsecureSkipVerify: proxy.Opts.SslInsecure,
+					KeyLogWriter:       helper.GetTlsKeyLogWriter(),
+					NextProtos:         []string{"h2"},
+					ServerName:         sni,
+				}
+				conn, err := chromeTLSDial(sessionCtx, rawConn, tlsCfg)
+				if err != nil {
+					rawConn.Close()
+					preDialCh <- preDialResult{err: err}
+					return
+				}
+				preDialCh <- preDialResult{conn: conn}
+			}()
+			// Cleanup: close the pre-dialed conn if it was never claimed.
+			go func() {
+				<-sessionCtx.Done()
+				select {
+				case r := <-preDialCh:
+					if r.conn != nil {
+						r.conn.Close()
+					}
+				case <-time.After(2 * time.Second):
+				}
+			}()
+
+			var preDialOnce sync.Once
 			connCtx.dialFn = func(ctx context.Context) error {
 				serverConn := newServerConn()
 				serverConn.Address = sni
 				serverConn.client = &http.Client{
 					Transport: &http2.Transport{
 						DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+							var firstDial bool
+							preDialOnce.Do(func() { firstDial = true })
+							if firstDial {
+								select {
+								case r := <-preDialCh:
+									if r.err == nil {
+										return r.conn, nil
+									}
+									// pre-dial failed; fall through to normal dial
+								case <-time.After(500 * time.Millisecond):
+									// pre-dial still in progress; fall through to normal dial
+								}
+							}
 							fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
 							rawConn, err := proxy.dialRawConn(ctx, network, addr, fakeReq)
 							if err != nil {
@@ -615,13 +673,29 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		res.WriteHeader(response.StatusCode)
 
 		flusher, _ := res.(http.Flusher)
+		// flushFn flushes the response writer and returns any error.
+		// x/net/http2's ResponseWriter implements FlushError() which surfaces
+		// stream-closed errors immediately; plain http.Flusher silently discards them.
+		type flusherErr interface{ FlushError() error }
+		flushFn := func() error {
+			if fe, ok := res.(flusherErr); ok {
+				return fe.FlushError()
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return nil
+		}
 		// Send the H2 HEADERS frame to the client immediately.  Without this
 		// flush, x/net/http2 delays the HEADERS frame until the first Write()
 		// call.  For SSE streams the first Write() may come 1+ seconds later
 		// (inspection window), by which time the client (e.g. Claude.exe) has
 		// already timed out waiting for any HTTP response.
 		if flusher != nil {
-			flusher.Flush()
+			if err := flushFn(); err != nil {
+				log.Warnf("reply: initial header flush failed (stream closed): %v", err)
+				return
+			}
 		}
 
 		copyStream := func(r io.Reader) error {
@@ -637,7 +711,10 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 						log.Warnf("copyStream: client write failed: %v", werr)
 						return werr
 					}
-					flusher.Flush()
+					if werr := flushFn(); werr != nil {
+						log.Warnf("copyStream: flush failed: %v", werr)
+						return werr
+					}
 				}
 				if err != nil {
 					if err == io.EOF {
