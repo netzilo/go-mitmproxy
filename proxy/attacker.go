@@ -171,19 +171,17 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 				},
 			}
 		} else {
-			// Lazy path: the client negotiated H2 with our proxy but no server
-			// connection has been pre-established.  Use H2 upstream so that the
-			// server sends response HEADERS immediately (before model generation
-			// starts), giving the downstream client its 200 OK early.
-			//
-			// GOAWAY is handled by retrying in attack() using the buffered request
-			// body (f.Request.Body []byte).
+			// Lazy path: create a single shared H2 transport for all requests on
+			// this session.  A background goroutine pre-dials TCP+TLS immediately
+			// (while the client H2 SETTINGS exchange is in progress) so the
+			// upstream connection is ready before the first request arrives,
+			// eliminating the serial dial latency that causes Cursor to RST_STREAM
+			// before seeing response HEADERS.
 			sni := connCtx.ClientConn.clientHello.ServerName
 			proxy := a.proxy
 
-			// Pre-dial: start TCP+TLS to the upstream server immediately so the
-			// connection is ready when the first request arrives, avoiding serial
-			// latency that causes Cursor to RST_STREAM before getting a response.
+			// Pre-dial: TCP+TLS in background using the session context so
+			// individual stream cancellations don't abort the connection.
 			type preDialResult struct {
 				conn net.Conn
 				err  error
@@ -211,7 +209,7 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 				}
 				preDialCh <- preDialResult{conn: conn}
 			}()
-			// Cleanup: close the pre-dialed conn if it was never claimed.
+			// Cleanup: drain pre-dialed conn if never claimed by DialTLSContext.
 			go func() {
 				<-sessionCtx.Done()
 				select {
@@ -224,31 +222,30 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 			}()
 
 			var preDialOnce sync.Once
-			connCtx.dialFn = func(ctx context.Context) error {
-				serverConn := newServerConn()
-				serverConn.Address = sni
-				serverConn.client = &http.Client{
-					Transport: &http2.Transport{
-						DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-							var firstDial bool
-							preDialOnce.Do(func() { firstDial = true })
-							if firstDial {
-								select {
-								case r := <-preDialCh:
-									if r.err == nil {
-										return r.conn, nil
-									}
-									// pre-dial failed; fall through to normal dial
-								case <-time.After(500 * time.Millisecond):
-									// pre-dial still in progress; fall through to normal dial
+			serverConn := newServerConn()
+			serverConn.Address = sni
+			serverConn.client = &http.Client{
+				Transport: &http2.Transport{
+					DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+						var usePreDial bool
+						preDialOnce.Do(func() { usePreDial = true })
+						if usePreDial {
+							select {
+							case r := <-preDialCh:
+								if r.err == nil {
+									return r.conn, nil
 								}
+								// pre-dial failed; fall through to fresh dial
+							case <-time.After(500 * time.Millisecond):
+								// pre-dial still in progress; fall through to fresh dial
 							}
-							fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
-							rawConn, err := proxy.dialRawConn(ctx, network, addr, fakeReq)
-							if err != nil {
-								return nil, err
-							}
-							conn, err := chromeTLSDial(ctx, rawConn, cfg)
+						}
+						fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
+						rawConn, err := proxy.dialRawConn(sessionCtx, "tcp", addr, fakeReq)
+						if err != nil {
+							return nil, err
+						}
+						conn, err := chromeTLSDial(sessionCtx, rawConn, cfg)
 						if err != nil {
 							rawConn.Close()
 							return nil, err
@@ -256,29 +253,29 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 						return conn, nil
 					},
 					// TLSClientConfig is the source for cfg passed to DialTLSContext above;
-						// chromeTLSDial reads InsecureSkipVerify and KeyLogWriter from it.
-						// NextProtos must include "h2" so cfg.NextProtos is non-empty when
-						// chromeTLSDial evaluates it; without this it falls back to ["http/1.1"]
-						// and the upstream negotiates HTTP/1.1 instead of h2.
-						TLSClientConfig: &tls.Config{
-							InsecureSkipVerify: proxy.Opts.SslInsecure,
-							KeyLogWriter:       helper.GetTlsKeyLogWriter(),
-							NextProtos:         []string{"h2"},
-						},
-						DisableCompression:        true,
-						MaxHeaderListSize:         262144, // Chrome SETTINGS_MAX_HEADER_LIST_SIZE
-						MaxDecoderHeaderTableSize: 65536,  // Chrome SETTINGS_HEADER_TABLE_SIZE
+					// chromeTLSDial reads InsecureSkipVerify and KeyLogWriter from it.
+					// NextProtos must include "h2" so cfg.NextProtos is non-empty when
+					// chromeTLSDial evaluates it; without this it falls back to ["http/1.1"]
+					// and the upstream negotiates HTTP/1.1 instead of h2.
+					TLSClientConfig: &tls.Config{
+						InsecureSkipVerify: proxy.Opts.SslInsecure,
+						KeyLogWriter:       helper.GetTlsKeyLogWriter(),
+						NextProtos:         []string{"h2"},
 					},
-					CheckRedirect: func(req *http.Request, via []*http.Request) error {
-						return http.ErrUseLastResponse
-					},
-				}
-				connCtx.ServerConn = serverConn
-				for _, addon := range proxy.Addons {
-					addon.ServerConnected(connCtx)
-				}
-				return nil
+					DisableCompression:        true,
+					MaxHeaderListSize:         262144, // Chrome SETTINGS_MAX_HEADER_LIST_SIZE
+					MaxDecoderHeaderTableSize: 65536,  // Chrome SETTINGS_HEADER_TABLE_SIZE
+				},
+				CheckRedirect: func(req *http.Request, via []*http.Request) error {
+					return http.ErrUseLastResponse
+				},
 			}
+			connCtx.ServerConn = serverConn
+			for _, addon := range proxy.Addons {
+				addon.ServerConnected(connCtx)
+			}
+			// dialFn intentionally not set: ServerConn is pre-configured with a
+			// shared H2 transport; attack() uses it directly without re-dialing.
 		}
 
 		go func() {
