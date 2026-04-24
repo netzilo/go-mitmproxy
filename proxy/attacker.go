@@ -119,6 +119,13 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 	connCtx.ClientConn.NegotiatedProtocol = clientTlsConn.ConnectionState().NegotiatedProtocol
 
 	if connCtx.ClientConn.NegotiatedProtocol == "h2" {
+		// Create the h2 session context before setting up the upstream client so
+		// that DialTLSContext reconnects can use the session lifetime rather than
+		// a per-stream context.  A canceled stream (RST_STREAM) must not abort
+		// the shared upstream transport reconnection.
+		sessionCtx := context.WithValue(context.Background(), connContextKey, connCtx)
+		sessionCtx, sessionCancel := context.WithCancel(sessionCtx)
+
 		if connCtx.ServerConn != nil {
 			// First-dial path (UpstreamCert mode): a real TLS connection to the
 			// server was established before the client handshake.  Use a bare
@@ -128,7 +135,7 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 			firstDial := true
 			connCtx.ServerConn.client = &http.Client{
 				Transport: &http2.Transport{
-					DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+					DialTLSContext: func(_ context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
 						dialMu.Lock()
 						first := firstDial
 						firstDial = false
@@ -138,12 +145,16 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 							return connCtx.ServerConn.tlsConn, nil
 						}
 
+						// Use the h2 session context, not the per-stream context
+						// passed in: an individual stream cancellation (client
+						// RST_STREAM) must not prevent the shared upstream transport
+						// from reconnecting after GOAWAY or a stale idle connection.
 						fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
-						rawConn, err := a.proxy.dialRawConn(ctx, network, addr, fakeReq)
+						rawConn, err := a.proxy.dialRawConn(sessionCtx, network, addr, fakeReq)
 						if err != nil {
 							return nil, err
 						}
-						conn, err := chromeTLSDial(ctx, rawConn, cfg)
+						conn, err := chromeTLSDial(sessionCtx, rawConn, cfg)
 						if err != nil {
 							rawConn.Close()
 							return nil, err
@@ -212,15 +223,13 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 			}
 		}
 
-		ctx := context.WithValue(context.Background(), connContextKey, connCtx)
-		ctx, cancel := context.WithCancel(ctx)
 		go func() {
 			<-connCtx.ClientConn.Conn.(*wrapClientConn).closeChan
-			cancel()
+			sessionCancel()
 		}()
 		go func() {
 			a.h2Server.ServeConn(clientTlsConn, &http2.ServeConnOpts{
-				Context:    ctx,
+				Context:    sessionCtx,
 				Handler:    a,
 				BaseConfig: a.server,
 			})
@@ -721,15 +730,14 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		reqBody = addon.StreamRequestModifier(f, reqBody)
 	}
 
+	// Upstream context is intentionally NOT tied to the h2 stream context.
+	// A client RST_STREAM (e.g. Cursor canceling the stream while we're
+	// dialing or reading the upstream response) must not abort an in-flight
+	// request: the transport reconnect and the response copy will clean up
+	// naturally, and defer upstreamCancel ensures the upstream request is
+	// released when attack() returns regardless.
 	upstreamCtx, upstreamCancel := context.WithCancel(context.Background())
 	defer upstreamCancel()
-	go func() {
-		select {
-		case <-req.Context().Done():
-			upstreamCancel()
-		case <-upstreamCtx.Done():
-		}
-	}()
 	proxyReqCtx := context.WithValue(upstreamCtx, proxyReqCtxKey, req)
 	proxyReq, err := http.NewRequestWithContext(proxyReqCtx, f.Request.Method, f.Request.URL.String(), reqBody)
 	if err != nil {
