@@ -47,6 +47,13 @@ type attacker struct {
 	listener *attackerListener
 }
 
+// isH2Proto reports whether the negotiated ALPN protocol is HTTP/2-compatible.
+// "grpc-exp" is Google's custom ALPN token used by Gemini.app and other Google
+// native apps — the wire format is identical to "h2".
+func isH2Proto(proto string) bool {
+	return proto == "h2" || proto == "grpc-exp"
+}
+
 func newAttacker(proxy *Proxy) (*attacker, error) {
 	ca, err := newCa(proxy.Opts)
 	if err != nil {
@@ -119,7 +126,7 @@ func (a *attacker) start() error {
 func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 	connCtx.ClientConn.NegotiatedProtocol = clientTlsConn.ConnectionState().NegotiatedProtocol
 
-	if connCtx.ClientConn.NegotiatedProtocol == "h2" {
+	if isH2Proto(connCtx.ClientConn.NegotiatedProtocol) {
 		// Create the h2 session context before setting up the upstream client so
 		// that DialTLSContext reconnects can use the session lifetime rather than
 		// a per-stream context.  A canceled stream (RST_STREAM) must not abort
@@ -434,7 +441,7 @@ func (a *attacker) serverTlsHandshake(ctx context.Context, connCtx *ConnContext)
 		return http.ErrUseLastResponse
 	}
 
-	if serverTlsState.NegotiatedProtocol == "h2" {
+	if isH2Proto(serverTlsState.NegotiatedProtocol) {
 		// Server negotiated h2: use http2.Transport directly.
 		// For h2 clients serveConn will replace this transport (firstDial not
 		// consumed yet so serverTlsConn stays fresh). For http/1.1 clients this
@@ -640,7 +647,7 @@ func (a *attacker) httpsLazyAttack(ctx context.Context, cconn net.Conn, req *htt
 	// first request, reuse the established TLS conn for subsequent ones).
 	// For H2 clients: serveConn installs a clean H1.1 upstream dial that
 	// avoids H2 GOAWAY killing SSE streams — no pre-dial needed.
-	if clientTlsConn.ConnectionState().NegotiatedProtocol != "h2" {
+	if !isH2Proto(clientTlsConn.ConnectionState().NegotiatedProtocol) {
 		a.initHttpsDialFn(req)
 	}
 
