@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"time"
 )
 
 // stripEarlyData wraps conn so that the first TLS ClientHello has the
@@ -62,7 +63,35 @@ func stripEarlyData(conn net.Conn) net.Conn {
 	copy(newRec, hdr[:3]) // type + version unchanged
 	binary.BigEndian.PutUint16(newRec[3:], uint16(len(newMsg)))
 
-	return &prefixedConn{Conn: conn, buf: append(newRec, newMsg...)}
+	prefix := append(newRec, newMsg...)
+
+	// Chrome sends 0-RTT early data records (type 0x17) immediately after the
+	// ClientHello, before waiting for the server response. Stripping the
+	// early_data extension from the ClientHello is not enough — Go's TLS server
+	// will see those 0x17 records and fail with "bad record MAC" because it has
+	// no early-data key. Drain all leading 0x17 records with a short deadline;
+	// any non-0x17 record header is prepended back so nothing is lost.
+	_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	for {
+		earlyHdr := make([]byte, 5)
+		if _, err := io.ReadFull(conn, earlyHdr); err != nil {
+			break // timeout or EOF — no more early data
+		}
+		if earlyHdr[0] != 0x17 {
+			// Not an application-data record — put it back in the prefix
+			prefix = append(prefix, earlyHdr...)
+			break
+		}
+		earlyLen := int(binary.BigEndian.Uint16(earlyHdr[3:5]))
+		earlyBody := make([]byte, earlyLen)
+		if _, err := io.ReadFull(conn, earlyBody); err != nil {
+			break
+		}
+		// discard early data record
+	}
+	_ = conn.SetReadDeadline(time.Time{}) // clear deadline
+
+	return &prefixedConn{Conn: conn, buf: prefix}
 }
 
 // removeEarlyDataExt removes the early_data extension (type 0x002a) from the
