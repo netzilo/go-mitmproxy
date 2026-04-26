@@ -690,7 +690,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		// already timed out waiting for any HTTP response.
 		if flusher != nil {
 			if err := flushFn(); err != nil {
-				log.Warnf("reply: initial header flush failed (stream closed): %v", err)
+				log.Debugf("reply: initial header flush failed (client gone): %v", err)
 				return
 			}
 		}
