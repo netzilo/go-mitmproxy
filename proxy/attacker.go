@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -39,12 +40,13 @@ type attackerConn struct {
 }
 
 type attacker struct {
-	proxy    *Proxy
-	ca       cert.CA
-	server   *http.Server
-	h2Server *http2.Server
-	client   *http.Client
-	listener *attackerListener
+	proxy        *Proxy
+	ca           cert.CA
+	server       *http.Server
+	h2Server     *http2.Server
+	client       *http.Client
+	streamClient *http.Client
+	listener     *attackerListener
 }
 
 func newAttacker(proxy *Proxy) (*attacker, error) {
@@ -53,37 +55,47 @@ func newAttacker(proxy *Proxy) (*attacker, error) {
 		return nil, err
 	}
 
+	baseTransport := func(forceH2, disableKeepAlives bool) *http.Transport {
+		return &http.Transport{
+			// When upstreamDialer is set use it directly (no CONNECT proxy overhead);
+			// otherwise fall back to the configured upstream proxy.
+			Proxy: func(req *http.Request) (*url.URL, error) {
+				if proxy.upstreamDialer != nil {
+					return nil, nil
+				}
+				return proxy.realUpstreamProxy()(req)
+			},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if proxy.upstreamDialer != nil {
+					return proxy.upstreamDialer(ctx, network, addr)
+				}
+				return (&net.Dialer{}).DialContext(ctx, network, addr)
+			},
+			ForceAttemptHTTP2:  forceH2,
+			DisableCompression: true,
+			DisableKeepAlives:  disableKeepAlives,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: proxy.Opts.SslInsecure,
+				KeyLogWriter:       helper.GetTlsKeyLogWriter(),
+			},
+		}
+	}
+	checkRedirect := func(req *http.Request, via []*http.Request) error {
+		// 禁止自动重定向
+		return http.ErrUseLastResponse
+	}
+	newUpstreamClient := func(forceH2, disableKeepAlives bool) *http.Client {
+		return &http.Client{
+			Transport:     baseTransport(forceH2, disableKeepAlives),
+			CheckRedirect: checkRedirect,
+		}
+	}
+
 	a := &attacker{
-		proxy: proxy,
-		ca:    ca,
-		client: &http.Client{
-			Transport: &http.Transport{
-				// When upstreamDialer is set use it directly (no CONNECT proxy overhead);
-				// otherwise fall back to the configured upstream proxy.
-				Proxy: func(req *http.Request) (*url.URL, error) {
-					if proxy.upstreamDialer != nil {
-						return nil, nil
-					}
-					return proxy.realUpstreamProxy()(req)
-				},
-				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					if proxy.upstreamDialer != nil {
-						return proxy.upstreamDialer(ctx, network, addr)
-					}
-					return (&net.Dialer{}).DialContext(ctx, network, addr)
-				},
-				ForceAttemptHTTP2:  true,
-				DisableCompression: true,
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: proxy.Opts.SslInsecure,
-					KeyLogWriter:       helper.GetTlsKeyLogWriter(),
-				},
-			},
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				// 禁止自动重定向
-				return http.ErrUseLastResponse
-			},
-		},
+		proxy:        proxy,
+		ca:           ca,
+		client:       newUpstreamClient(true, false),
+		streamClient: newUpstreamClient(true, true),
 		listener: &attackerListener{
 			connChan: make(chan net.Conn),
 		},
@@ -177,7 +189,7 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 			// upstream connection is ready before the first request arrives,
 			// eliminating the serial dial latency that causes Cursor to RST_STREAM
 			// before seeing response HEADERS.
-			sni := connCtx.ClientConn.clientHello.ServerName
+			sni := tlsServerName(connCtx, connCtx.ClientConn.clientHello.ServerName)
 			proxy := a.proxy
 
 			// Pre-dial: TCP+TLS in background using the session context so
@@ -188,7 +200,7 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 			}
 			preDialCh := make(chan preDialResult, 1)
 			go func() {
-				addr := sni + ":443"
+				addr := net.JoinHostPort(sni, "443")
 				fakeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
 				rawConn, err := proxy.dialRawConn(sessionCtx, "tcp", addr, fakeReq)
 				if err != nil {
@@ -361,6 +373,7 @@ func (a *attacker) serverTlsHandshake(ctx context.Context, connCtx *ConnContext)
 	proxy := a.proxy
 	clientHello := connCtx.ClientConn.clientHello
 	serverConn := connCtx.ServerConn
+	serverName := tlsServerName(connCtx, clientHello.ServerName)
 
 	// When the client negotiated HTTP/1.1 with us, don't offer h2 to the upstream.
 	// If we do, the server may negotiate h2 but serverConn.client uses http.Transport
@@ -382,7 +395,7 @@ func (a *attacker) serverTlsHandshake(ctx context.Context, connCtx *ConnContext)
 	serverTlsConfig := &tls.Config{
 		InsecureSkipVerify: proxy.Opts.SslInsecure,
 		KeyLogWriter:       helper.GetTlsKeyLogWriter(),
-		ServerName:         clientHello.ServerName,
+		ServerName:         serverName,
 		NextProtos:         nextProtos,
 		// CurvePreferences:   clientHello.SupportedCurves, // todo: 如果打开会出错
 		CipherSuites: clientHello.CipherSuites,
@@ -481,6 +494,214 @@ func (a *attacker) serverTlsHandshake(ctx context.Context, connCtx *ConnContext)
 	return nil
 }
 
+func tlsServerName(connCtx *ConnContext, clientHelloServerName string) string {
+	if clientHelloServerName != "" {
+		return clientHelloServerName
+	}
+	if connCtx == nil || connCtx.ServerConn == nil {
+		return ""
+	}
+	host := connCtx.ServerConn.Address
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if net.ParseIP(host) != nil {
+		return ""
+	}
+	return host
+}
+
+func acceptsEventStream(header http.Header) bool {
+	return strings.Contains(strings.ToLower(header.Get("Accept")), "text/event-stream")
+}
+
+func isJSONRequest(header http.Header) bool {
+	ct := strings.ToLower(header.Get("Content-Type"))
+	if i := strings.Index(ct, ";"); i != -1 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	return ct == "application/json" || strings.HasSuffix(ct, "+json")
+}
+
+func topLevelJSONBool(body []byte, key string) (bool, bool) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	tok, err := dec.Token()
+	if err != nil {
+		return false, false
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		return false, false
+	}
+	for dec.More() {
+		tok, err = dec.Token()
+		if err != nil {
+			return false, false
+		}
+		name, ok := tok.(string)
+		if !ok {
+			return false, false
+		}
+		if name == key {
+			var value bool
+			if err := dec.Decode(&value); err != nil {
+				return false, false
+			}
+			return value, true
+		}
+		var discard json.RawMessage
+		if err := dec.Decode(&discard); err != nil {
+			return false, false
+		}
+	}
+	return false, false
+}
+
+func wantsStreamingResponse(header http.Header, body []byte) bool {
+	if acceptsEventStream(header) {
+		return true
+	}
+	if len(body) == 0 || !isJSONRequest(header) {
+		return false
+	}
+	stream, ok := topLevelJSONBool(body, "stream")
+	return ok && stream
+}
+
+func forceIdentityEncoding(req *http.Request) {
+	if req == nil {
+		return
+	}
+	req.Header.Del("Accept-Encoding")
+	req.Header.Set("Accept-Encoding", "identity")
+}
+
+func responseHopByHopHeaders(header http.Header) map[string]struct{} {
+	headers := map[string]struct{}{
+		"Connection":          {},
+		"Keep-Alive":          {},
+		"Proxy-Authenticate":  {},
+		"Proxy-Authorization": {},
+		"Proxy-Connection":    {},
+		"Te":                  {},
+		"Trailer":             {},
+		"Transfer-Encoding":   {},
+		"Upgrade":             {},
+	}
+	for _, connectionHeader := range header.Values("Connection") {
+		for _, token := range strings.Split(connectionHeader, ",") {
+			if token = strings.TrimSpace(token); token != "" {
+				headers[http.CanonicalHeaderKey(token)] = struct{}{}
+			}
+		}
+	}
+	return headers
+}
+
+func copyResponseHeaders(dst, src http.Header, streamingBody bool) {
+	if src == nil {
+		return
+	}
+	skip := responseHopByHopHeaders(src)
+	if streamingBody {
+		// Streaming filters can transform response bytes (for example gzip SSE
+		// decoding), so any upstream Content-Length is no longer authoritative.
+		skip["Content-Length"] = struct{}{}
+	}
+	for key, value := range src {
+		if _, ok := skip[http.CanonicalHeaderKey(key)]; ok {
+			continue
+		}
+		for _, v := range value {
+			dst.Add(key, v)
+		}
+	}
+}
+
+func isEventStreamHeader(header http.Header) bool {
+	return strings.Contains(strings.ToLower(header.Get("Content-Type")), "text/event-stream")
+}
+
+func lastSSEEventBoundary(buf []byte) int {
+	last := -1
+	lastLen := 0
+	for _, sep := range [][]byte{
+		[]byte("\n\n"),
+		[]byte("\r\n\r\n"),
+		[]byte("\r\r"),
+		[]byte("\n\r\n"),
+		[]byte("\r\n\n"),
+	} {
+		if idx := bytes.LastIndex(buf, sep); idx >= 0 && idx+len(sep) > last+lastLen {
+			last = idx
+			lastLen = len(sep)
+		}
+	}
+	if last < 0 {
+		return -1
+	}
+	return last + lastLen
+}
+
+const rawSSEHeartbeatInterval = time.Second
+
+var rawSSEHeartbeat = []byte(":\n\n")
+
+func updateSSETail(tail, chunk []byte) []byte {
+	const maxBoundaryLen = len("\r\n\r\n")
+	if len(chunk) == 0 {
+		return tail
+	}
+	if len(chunk) >= maxBoundaryLen {
+		out := make([]byte, maxBoundaryLen)
+		copy(out, chunk[len(chunk)-maxBoundaryLen:])
+		return out
+	}
+	combined := make([]byte, 0, len(tail)+len(chunk))
+	combined = append(combined, tail...)
+	combined = append(combined, chunk...)
+	if len(combined) > maxBoundaryLen {
+		combined = combined[len(combined)-maxBoundaryLen:]
+	}
+	return combined
+}
+
+func endsAtSSEEventBoundary(tail []byte) bool {
+	return len(tail) == 0 || lastSSEEventBoundary(tail) == len(tail)
+}
+
+func resetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
+}
+
+func makeProxyRequest(ctx context.Context, f *Flow, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, f.Request.Method, f.Request.URL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range f.Request.Header {
+		for _, v := range value {
+			req.Header.Add(key, v)
+		}
+	}
+	return req, nil
+}
+
+func canReplayRequest(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
 func (a *attacker) initHttpsDialFn(req *http.Request) {
 	connCtx := req.Context().Value(connContextKey).(*ConnContext)
 
@@ -554,7 +775,11 @@ func (a *attacker) httpsTlsDial(ctx context.Context, cconn net.Conn, conn net.Co
 				}
 			}
 
-			c, err := a.ca.GetCert(chi.ServerName)
+			certName := tlsServerName(connCtx, chi.ServerName)
+			if certName == "" {
+				certName = chi.ServerName
+			}
+			c, err := a.ca.GetCert(certName)
 			if err != nil {
 				return nil, err
 			}
@@ -619,7 +844,11 @@ func (a *attacker) httpsLazyAttack(ctx context.Context, cconn net.Conn, req *htt
 		SessionTicketsDisabled: true, // 设置此值为 true ，确保每次都会调用下面的 GetConfigForClient 方法
 		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
 			connCtx.ClientConn.clientHello = chi
-			c, err := a.ca.GetCert(chi.ServerName)
+			certName := tlsServerName(connCtx, chi.ServerName)
+			if certName == "" {
+				certName = chi.ServerName
+			}
+			c, err := a.ca.GetCert(certName)
 			if err != nil {
 				return nil, err
 			}
@@ -657,15 +886,19 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 	})
 
 	reply := func(response *Response, body io.Reader) {
-		if response.Header != nil {
-			for key, value := range response.Header {
-				for _, v := range value {
-					res.Header().Add(key, v)
-				}
-			}
-		}
-		if response.close {
+		streamingBody := body != nil || response.BodyReader != nil
+		copyResponseHeaders(res.Header(), response.Header, streamingBody)
+		if response.close && req.ProtoMajor < 2 {
 			res.Header().Set("Connection", "close")
+		}
+		isEventStream := isEventStreamHeader(response.Header)
+		eventStream := isEventStream && !proxy.Opts.RawSSEPassthrough
+		rawSSEPassthrough := isEventStream && proxy.Opts.RawSSEPassthrough
+		if eventStream {
+			log.Debugf("using SSE event-boundary downstream flush for %s", req.URL.String())
+		}
+		if rawSSEPassthrough {
+			log.Debugf("using SSE raw downstream heartbeat for %s", req.URL.String())
 		}
 		res.WriteHeader(response.StatusCode)
 
@@ -695,26 +928,126 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 			}
 		}
 
+		writeAndFlush := func(p []byte) error {
+			if len(p) == 0 {
+				return nil
+			}
+			if _, werr := res.Write(p); werr != nil {
+				log.Warnf("copyStream: client write failed: %v", werr)
+				return werr
+			}
+			if werr := flushFn(); werr != nil {
+				log.Warnf("copyStream: flush failed: %v", werr)
+				return werr
+			}
+			return nil
+		}
+
 		copyStream := func(r io.Reader) error {
 			if r == nil {
 				return nil
 			}
+			if rawSSEPassthrough {
+				type readResult struct {
+					data []byte
+					err  error
+				}
+				readCh := make(chan readResult, 1)
+				readNext := func() {
+					go func() {
+						buf := make([]byte, 32*1024)
+						n, err := r.Read(buf)
+						if n > 0 {
+							buf = buf[:n]
+						} else {
+							buf = nil
+						}
+						readCh <- readResult{data: buf, err: err}
+					}()
+				}
+
+				heartbeat := time.NewTimer(rawSSEHeartbeatInterval)
+				defer heartbeat.Stop()
+				sseTail := []byte(nil)
+
+				readNext()
+				for {
+					select {
+					case result := <-readCh:
+						if len(result.data) > 0 {
+							if err := writeAndFlush(result.data); err != nil {
+								return err
+							}
+							sseTail = updateSSETail(sseTail, result.data)
+							resetTimer(heartbeat, rawSSEHeartbeatInterval)
+						}
+						if result.err != nil {
+							if result.err == io.EOF {
+								return nil
+							}
+							log.Warnf("copyStream: upstream read failed: %v", result.err)
+							return result.err
+						}
+						readNext()
+
+					case <-heartbeat.C:
+						if endsAtSSEEventBoundary(sseTail) {
+							if err := writeAndFlush(rawSSEHeartbeat); err != nil {
+								return err
+							}
+							sseTail = updateSSETail(sseTail, rawSSEHeartbeat)
+						}
+						heartbeat.Reset(rawSSEHeartbeatInterval)
+					}
+				}
+			}
 
 			buf := make([]byte, 32*1024)
+			var pending []byte
+			const maxPendingSSEBytes = 1024 * 1024
+
+			flushSSE := func(force bool) error {
+				if len(pending) == 0 {
+					return nil
+				}
+				cut := lastSSEEventBoundary(pending)
+				if force {
+					cut = len(pending)
+				} else if cut < 0 {
+					if len(pending) < maxPendingSSEBytes {
+						return nil
+					}
+					// Malformed or extremely large event: flush rather than let
+					// one response consume unbounded memory.
+					cut = len(pending)
+				}
+				if err := writeAndFlush(pending[:cut]); err != nil {
+					return err
+				}
+				copy(pending, pending[cut:])
+				pending = pending[:len(pending)-cut]
+				return nil
+			}
+
 			for {
 				n, err := r.Read(buf)
 				if n > 0 {
-					if _, werr := res.Write(buf[:n]); werr != nil {
-						log.Warnf("copyStream: client write failed: %v", werr)
-						return werr
-					}
-					if werr := flushFn(); werr != nil {
-						log.Warnf("copyStream: flush failed: %v", werr)
-						return werr
+					if eventStream {
+						pending = append(pending, buf[:n]...)
+						if werr := flushSSE(false); werr != nil {
+							return werr
+						}
+					} else {
+						if werr := writeAndFlush(buf[:n]); werr != nil {
+							return werr
+						}
 					}
 				}
 				if err != nil {
 					if err == io.EOF {
+						if eventStream {
+							return flushSSE(true)
+						}
 						return nil
 					}
 					log.Warnf("copyStream: upstream read failed: %v", err)
@@ -813,7 +1146,8 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 	upstreamCtx, upstreamCancel := context.WithCancel(context.Background())
 	defer upstreamCancel()
 	proxyReqCtx := context.WithValue(upstreamCtx, proxyReqCtxKey, req)
-	proxyReq, err := http.NewRequestWithContext(proxyReqCtx, f.Request.Method, f.Request.URL.String(), reqBody)
+
+	proxyReq, err := makeProxyRequest(proxyReqCtx, f, reqBody)
 	if err != nil {
 		for _, addon := range proxy.Addons {
 			addon.RequestError(f, err)
@@ -822,13 +1156,19 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	for key, value := range f.Request.Header {
-		for _, v := range value {
-			proxyReq.Header.Add(key, v)
-		}
-	}
-
 	useSeparateClient := f.UseSeparateClient
+	separateClient := a.client
+	expectsStreamingResponse := wantsStreamingResponse(f.Request.Header, f.Request.Body)
+	if expectsStreamingResponse {
+		// Streaming responses cannot be safely resumed once bytes have been sent
+		// to the client. Use a fresh H2-capable upstream connection with
+		// keepalives disabled so the stream is isolated from shared-connection
+		// GOAWAY while still letting servers negotiate HTTP/2 when supported.
+		useSeparateClient = true
+		separateClient = a.streamClient
+		forceIdentityEncoding(proxyReq)
+		log.Debugf("using isolated upstream client for streaming response request %s acceptEncoding=%s", f.Request.URL.String(), proxyReq.Header.Get("Accept-Encoding"))
+	}
 	if !useSeparateClient {
 		if rawReqUrlHost != f.Request.URL.Host || rawReqUrlScheme != f.Request.URL.Scheme {
 			useSeparateClient = true
@@ -837,7 +1177,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 
 	var proxyRes *http.Response
 	if useSeparateClient {
-		proxyRes, err = a.client.Do(proxyReq)
+		proxyRes, err = separateClient.Do(proxyReq)
 	} else {
 		if f.ConnContext.ServerConn == nil && f.ConnContext.dialFn != nil {
 			if err := f.ConnContext.dialFn(req.Context()); err != nil {
@@ -859,7 +1199,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		// so we can re-issue on the fresh connection the transport opens.
 		// f.Stream (SSE) is intentionally included: a GOAWAY before the first
 		// response byte is safe to retry without duplicating downstream data.
-		if err != nil && f.Request.Body != nil &&
+		if err != nil && f.Request.Body != nil && canReplayRequest(f.Request.Method) &&
 			strings.Contains(err.Error(), "GOAWAY") {
 			log.Infof("GOAWAY on upstream Do(), retrying: %v", err)
 			retryReq, e2 := http.NewRequestWithContext(proxyReqCtx, f.Request.Method, f.Request.URL.String(), bytes.NewReader(f.Request.Body))
@@ -904,17 +1244,21 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 	}
 
 	// 检测是否为 SSE 响应，如果是则强制使用流式模式
-	isSSE := strings.Contains(f.Response.Header.Get("Content-Type"), "text/event-stream")
+	isSSE := isEventStreamHeader(f.Response.Header)
 	if isSSE {
 		f.Stream = true
-		f.SSE = newSSEData()
+		if !proxy.Opts.RawSSEPassthrough {
+			f.SSE = newSSEData()
 
-		// 触发 SSEStart hook
-		for _, addon := range proxy.Addons {
-			addon.SSEStart(f)
+			// 触发 SSEStart hook
+			for _, addon := range proxy.Addons {
+				addon.SSEStart(f)
+			}
+		} else {
+			log.Debugf("SSE raw passthrough enabled for %s; generic SSE hooks disabled, stream modifiers still active", f.Request.URL.String())
 		}
 
-		log.Debugf("SSE stream detected for %s", f.Request.URL.String())
+		log.Debugf("SSE stream detected for %s upstreamProto=%s status=%d contentEncoding=%q contentLength=%d", f.Request.URL.String(), proxyRes.Proto, proxyRes.StatusCode, proxyRes.Header.Get("Content-Encoding"), proxyRes.ContentLength)
 	}
 
 	// Read response body
@@ -944,15 +1288,26 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 
 	// 如果是 SSE，包装 reader 以实时解析事件
 	if isSSE {
+		reissueClient := a.client
+		if useSeparateClient {
+			reissueClient = separateClient
+		} else if f.ConnContext.ServerConn != nil && f.ConnContext.ServerConn.client != nil {
+			reissueClient = f.ConnContext.ServerConn.client
+		}
+
 		// Wrap with a GOAWAY-resilient reader before the SSE parser so that
 		// a mid-stream upstream connection rotation is handled transparently:
 		//   • If no bytes read yet → re-issue request on fresh connection (safe replay).
 		//   • If bytes already read → return io.EOF so downstream gets a clean
 		//     truncated response rather than ERR_CONNECTION_CLOSED.
 		gb := &goawayBody{
-			body: proxyRes.Body,
-			ctx:  proxyReqCtx,
+			body:        proxyRes.Body,
+			ctx:         proxyReqCtx,
+			retriesLeft: maxGoawayRetries,
 			reissue: func() (io.ReadCloser, error) {
+				if !canReplayRequest(f.Request.Method) {
+					return nil, io.EOF
+				}
 				if f.Request.Body == nil {
 					return nil, io.EOF // un-buffered body; cannot replay
 				}
@@ -965,7 +1320,10 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 						retryReq.Header.Add(key, v)
 					}
 				}
-				r, e2 := f.ConnContext.ServerConn.client.Do(retryReq)
+				if expectsStreamingResponse {
+					forceIdentityEncoding(retryReq)
+				}
+				r, e2 := reissueClient.Do(retryReq)
 				if e2 != nil {
 					return nil, e2
 				}
@@ -981,7 +1339,9 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		// gb.Close() ensures the retry body is also released when attack() returns.
 		defer gb.Close()
 		resBody = gb
-		resBody = newSSEReader(f, resBody)
+		if !proxy.Opts.RawSSEPassthrough {
+			resBody = newSSEReader(f, resBody)
+		}
 	}
 
 	for _, addon := range proxy.Addons {
