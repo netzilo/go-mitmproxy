@@ -950,8 +950,9 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		//   • If bytes already read → return io.EOF so downstream gets a clean
 		//     truncated response rather than ERR_CONNECTION_CLOSED.
 		gb := &goawayBody{
-			body: proxyRes.Body,
-			ctx:  proxyReqCtx,
+			body:        proxyRes.Body,
+			ctx:         proxyReqCtx,
+			retriesLeft: maxGoawayRetries,
 			reissue: func() (io.ReadCloser, error) {
 				if f.Request.Body == nil {
 					return nil, io.EOF // un-buffered body; cannot replay

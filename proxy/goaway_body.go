@@ -15,12 +15,14 @@ import (
 //     connection the transport opens and continue seamlessly.
 //   - If bytes were already read: return io.EOF so the downstream receives a
 //     clean truncated response instead of ERR_CONNECTION_CLOSED.
+const maxGoawayRetries = 5
+
 type goawayBody struct {
-	body      io.ReadCloser
-	reissue   func() (io.ReadCloser, error)
-	ctx       context.Context // upstream request context; if cancelled, don't treat as GOAWAY
-	bytesRead int64
-	retried   bool
+	body        io.ReadCloser
+	reissue     func() (io.ReadCloser, error)
+	ctx         context.Context // upstream request context; if cancelled, don't treat as GOAWAY
+	bytesRead   int64           // bytes read from the CURRENT body (resets on each retry)
+	retriesLeft int
 }
 
 // isGoawayErr returns true only when err signals an HTTP/2 GOAWAY-type
@@ -49,13 +51,14 @@ func (g *goawayBody) Read(p []byte) (int, error) {
 	}
 
 	// GOAWAY or closed-connection error from upstream (not a context cancel).
-	if g.bytesRead == 0 && !g.retried && g.reissue != nil {
-		// No data piped yet — safe to replay on the new connection.
+	if g.bytesRead == 0 && g.retriesLeft > 0 && g.reissue != nil {
+		// No data from current body yet — safe to replay on the new connection.
+		g.retriesLeft--
 		newBody, retryErr := g.reissue()
 		if retryErr == nil {
 			g.body.Close()
 			g.body = newBody
-			g.retried = true
+			g.bytesRead = 0 // reset for the new body
 			// Read from the new body for this call.
 			rn, rerr := g.body.Read(p)
 			if rn > 0 {
