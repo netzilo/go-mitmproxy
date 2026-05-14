@@ -857,7 +857,9 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		// GOAWAY retry: the H2 upstream rotated its connection while our
 		// request was in-flight.  f.Request.Body is already buffered as []byte
 		// so we can re-issue on the fresh connection the transport opens.
-		if err != nil && !f.Stream && f.Request.Body != nil &&
+		// f.Stream (SSE) is intentionally included: a GOAWAY before the first
+		// response byte is safe to retry without duplicating downstream data.
+		if err != nil && f.Request.Body != nil &&
 			strings.Contains(err.Error(), "GOAWAY") {
 			log.Infof("GOAWAY on upstream Do(), retrying: %v", err)
 			retryReq, e2 := http.NewRequestWithContext(proxyReqCtx, f.Request.Method, f.Request.URL.String(), bytes.NewReader(f.Request.Body))
@@ -942,6 +944,43 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 
 	// 如果是 SSE，包装 reader 以实时解析事件
 	if isSSE {
+		// Wrap with a GOAWAY-resilient reader before the SSE parser so that
+		// a mid-stream upstream connection rotation is handled transparently:
+		//   • If no bytes read yet → re-issue request on fresh connection (safe replay).
+		//   • If bytes already read → return io.EOF so downstream gets a clean
+		//     truncated response rather than ERR_CONNECTION_CLOSED.
+		gb := &goawayBody{
+			body: proxyRes.Body,
+			ctx:  proxyReqCtx,
+			reissue: func() (io.ReadCloser, error) {
+				if f.Request.Body == nil {
+					return nil, io.EOF // un-buffered body; cannot replay
+				}
+				retryReq, e2 := http.NewRequestWithContext(proxyReqCtx, f.Request.Method, f.Request.URL.String(), bytes.NewReader(f.Request.Body))
+				if e2 != nil {
+					return nil, e2
+				}
+				for key, value := range f.Request.Header {
+					for _, v := range value {
+						retryReq.Header.Add(key, v)
+					}
+				}
+				r, e2 := f.ConnContext.ServerConn.client.Do(retryReq)
+				if e2 != nil {
+					return nil, e2
+				}
+				if r.StatusCode != proxyRes.StatusCode {
+					r.Body.Close()
+					return nil, io.EOF // unexpected status on retry; fall through to clean EOF
+				}
+				return r.Body, nil
+			},
+		}
+		// gb.Close() closes whichever body is current (original or retry).
+		// The existing defer proxyRes.Body.Close() still closes the original;
+		// gb.Close() ensures the retry body is also released when attack() returns.
+		defer gb.Close()
+		resBody = gb
 		resBody = newSSEReader(f, resBody)
 	}
 
