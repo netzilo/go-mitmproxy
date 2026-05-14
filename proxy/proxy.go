@@ -22,6 +22,11 @@ type Options struct {
 	NewCaFunc         func() (cert.CA, error) //创建 Ca 的函数
 	Upstream          string
 	LogFilePath       string // Path to write logs to file
+	// RawSSEPassthrough skips go-mitmproxy's generic SSE hook parser and
+	// event-boundary buffering. StreamResponseModifier addons still receive
+	// and can inspect/block the stream. The proxy may emit SSE comment
+	// heartbeats between complete events to keep the downstream leg alive.
+	RawSSEPassthrough bool
 }
 
 type Proxy struct {

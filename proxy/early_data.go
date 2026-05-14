@@ -71,7 +71,7 @@ func stripEarlyData(conn net.Conn) net.Conn {
 	// will see those 0x17 records and fail with "bad record MAC" because it has
 	// no early-data key. Drain all leading 0x17 records with a short deadline;
 	// any non-0x17 record header is prepended back so nothing is lost.
-	_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	for {
 		earlyHdr := make([]byte, 5)
 		if _, err := io.ReadFull(conn, earlyHdr); err != nil {
