@@ -156,12 +156,16 @@ func (h *webSocketHandler) forwardMessages(clientWS, serverWS *websocket.Conn, f
 				return
 			}
 
-			f.WebScoket.addMessage(msgType, msg, true)
-			for _, addon := range h.proxy.Addons {
-				addon.WebSocketMessage(f)
+			relay := f.WebScoket.DispatchMessage(msgType, msg, true, func() {
+				for _, addon := range h.proxy.Addons {
+					addon.WebSocketMessage(f)
+				}
+			})
+			if relay == nil {
+				continue // addon set content to nil — frame blocked
 			}
 
-			if err := serverWS.WriteMessage(msgType, msg); err != nil {
+			if err := serverWS.WriteMessage(msgType, relay); err != nil {
 				log.Errorf("Client -> Server: Write error: %v", err)
 				errChan <- err
 				return
@@ -189,12 +193,16 @@ func (h *webSocketHandler) forwardMessages(clientWS, serverWS *websocket.Conn, f
 				return
 			}
 
-			f.WebScoket.addMessage(msgType, msg, false)
-			for _, addon := range h.proxy.Addons {
-				addon.WebSocketMessage(f)
+			relay := f.WebScoket.DispatchMessage(msgType, msg, false, func() {
+				for _, addon := range h.proxy.Addons {
+					addon.WebSocketMessage(f)
+				}
+			})
+			if relay == nil {
+				continue // addon set content to nil — frame blocked
 			}
 
-			if err := clientWS.WriteMessage(msgType, msg); err != nil {
+			if err := clientWS.WriteMessage(msgType, relay); err != nil {
 				log.Errorf("Server -> Client: Write error: %v", err)
 				errChan <- err
 				return
@@ -250,9 +258,24 @@ func (h *webSocketHandler) handleWSS(res http.ResponseWriter, req *http.Request)
 		},
 	}
 
-	// Dialer 会自动添加所有必需的 WebSocket 握手头
-	// 我们不传递 req.Header，避免重复头的错误
-	serverWS, _, err := dialer.Dial(serverURL, nil)
+	// Forward original request headers to the upstream WebSocket server so that
+	// authentication (Authorization, Cookie, etc.) is preserved. Strip headers
+	// that the gorilla dialer adds automatically to avoid duplicates.
+	wsSkipHeaders := map[string]bool{
+		"Upgrade":                  true,
+		"Connection":               true,
+		"Sec-Websocket-Key":        true,
+		"Sec-Websocket-Version":    true,
+		"Sec-Websocket-Extensions": true,
+		"Sec-Websocket-Protocol":   true,
+	}
+	upstreamHeaders := make(http.Header)
+	for k, v := range req.Header {
+		if !wsSkipHeaders[http.CanonicalHeaderKey(k)] {
+			upstreamHeaders[k] = v
+		}
+	}
+	serverWS, _, err := dialer.Dial(serverURL, upstreamHeaders)
 	if err != nil {
 		log.Errorf("Failed to dial WSS server: %v", err)
 		return err

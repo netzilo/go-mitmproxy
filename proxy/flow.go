@@ -177,7 +177,11 @@ func newWebSocketMessage(msgType int, content []byte, fromClient bool) *WebSocke
 }
 
 type WebSocketData struct {
-	Messages []*WebSocketMessage
+	Messages   []*WebSocketMessage
+	// CurrentMsg is the message that triggered the current WebSocketMessage callback.
+	// Set by DispatchMessage under the lock before calling addons; read by addons
+	// directly (no lock needed — DispatchMessage holds it for the duration).
+	CurrentMsg *WebSocketMessage
 
 	mu sync.Mutex
 }
@@ -188,11 +192,20 @@ func newWebSocketData() *WebSocketData {
 	}
 }
 
-func (wsData *WebSocketData) addMessage(msgType int, content []byte, fromClient bool) {
+// DispatchMessage appends the message, sets CurrentMsg, calls dispatch under
+// the lock, then returns CurrentMsg.Content. Addons may modify CurrentMsg.Content
+// during dispatch (e.g. for redaction); the caller should relay the returned
+// content rather than the original to propagate those modifications.
+// The lock is held for the duration of dispatch — addons must NOT acquire it.
+// defer guarantees the unlock even on panic.
+func (wsData *WebSocketData) DispatchMessage(msgType int, content []byte, fromClient bool, dispatch func()) []byte {
 	msg := newWebSocketMessage(msgType, content, fromClient)
 	wsData.mu.Lock()
 	defer wsData.mu.Unlock()
 	wsData.Messages = append(wsData.Messages, msg)
+	wsData.CurrentMsg = msg
+	dispatch()
+	return wsData.CurrentMsg.Content
 }
 
 // SSEEvent represents a single Server-Sent Event
