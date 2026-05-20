@@ -19,6 +19,24 @@ var normalErrMsgs []string = []string{
 	"connect: connection refused",
 	"connect: connection reset by peer",
 	"use of closed network connection",
+	// Long-lived streaming connections (SSE, LinkedIn realtime, etc.) end when
+	// the server or client closes the H2 stream. These are normal terminations,
+	// not bugs — downgrade to DEBUG so they don't pollute the error log.
+	"http2: stream closed",
+	"client disconnected",
+}
+
+// isStreamEnd reports whether err represents a normal end-of-stream condition
+// for a long-lived HTTP/2 streaming connection (SSE, LinkedIn realtime, etc.).
+// These are expected when the server or client closes their side of the H2
+// stream and should be treated as EOF rather than as unexpected errors.
+func isStreamEnd(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "http2: stream closed") ||
+		strings.Contains(msg, "client disconnected")
 }
 
 // 仅打印预料之外的错误信息

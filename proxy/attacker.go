@@ -933,11 +933,19 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 				return nil
 			}
 			if _, werr := res.Write(p); werr != nil {
-				log.Warnf("copyStream: client write failed: %v", werr)
+				if isStreamEnd(werr) {
+					log.Debugf("copyStream: client write ended: %v", werr)
+				} else {
+					log.Warnf("copyStream: client write failed: %v", werr)
+				}
 				return werr
 			}
 			if werr := flushFn(); werr != nil {
-				log.Warnf("copyStream: flush failed: %v", werr)
+				if isStreamEnd(werr) {
+					log.Debugf("copyStream: flush ended: %v", werr)
+				} else {
+					log.Warnf("copyStream: flush failed: %v", werr)
+				}
 				return werr
 			}
 			return nil
@@ -982,7 +990,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 							resetTimer(heartbeat, rawSSEHeartbeatInterval)
 						}
 						if result.err != nil {
-							if result.err == io.EOF {
+							if result.err == io.EOF || isStreamEnd(result.err) {
 								return nil
 							}
 							log.Warnf("copyStream: upstream read failed: %v", result.err)
@@ -1044,7 +1052,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 					}
 				}
 				if err != nil {
-					if err == io.EOF {
+					if err == io.EOF || isStreamEnd(err) {
 						if eventStream {
 							return flushSSE(true)
 						}
