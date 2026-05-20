@@ -1271,6 +1271,15 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		log.Debugf("SSE stream detected for %s upstreamProto=%s status=%d contentEncoding=%q contentLength=%d", f.Request.URL.String(), proxyRes.Proto, proxyRes.StatusCode, proxyRes.Header.Get("Content-Encoding"), proxyRes.ContentLength)
 	}
 
+	// application/octet-stream is opaque binary data (e.g. React Server
+	// Components from LinkedIn). Buffering it before forwarding causes
+	// multi-second latency for large responses (8+ MB) which makes the
+	// browser close the H2 stream before we can deliver the response.
+	// Stream it directly — there is no meaningful content to inspect.
+	if strings.HasPrefix(proxyRes.Header.Get("Content-Type"), "application/octet-stream") {
+		f.Stream = true
+	}
+
 	// Read response body
 	var resBody io.Reader = proxyRes.Body
 	if !f.Stream {
