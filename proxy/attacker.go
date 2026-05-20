@@ -824,7 +824,9 @@ func (a *attacker) httpsTlsDial(ctx context.Context, cconn net.Conn, conn net.Co
 	case err := <-errChan1:
 		cconn.Close()
 		conn.Close()
-		log.Error(err)
+		// Browser closed the connection before finishing the TLS handshake —
+		// normal when Chrome abandons a speculative pre-connection.
+		logErr(log, err)
 		return
 	case <-clientHandshakeDoneChan:
 	}
@@ -861,7 +863,7 @@ func (a *attacker) httpsLazyAttack(ctx context.Context, cconn net.Conn, req *htt
 	})
 	if err := clientTlsConn.HandshakeContext(ctx); err != nil {
 		cconn.Close()
-		log.Error(err)
+		logErr(log, err)
 		return
 	}
 

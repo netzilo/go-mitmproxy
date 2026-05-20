@@ -24,6 +24,9 @@ var normalErrMsgs []string = []string{
 	// not bugs — downgrade to DEBUG so they don't pollute the error log.
 	"http2: stream closed",
 	"client disconnected",
+	// Browser closed the connection before the TLS handshake finished —
+	// normal when Chrome abandons a speculative pre-connection.
+	"EOF",
 }
 
 // isStreamEnd reports whether err represents a normal end-of-stream condition

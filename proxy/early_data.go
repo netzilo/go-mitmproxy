@@ -69,13 +69,19 @@ func stripEarlyData(conn net.Conn) net.Conn {
 	// ClientHello, before waiting for the server response. Stripping the
 	// early_data extension from the ClientHello is not enough — Go's TLS server
 	// will see those 0x17 records and fail with "bad record MAC" because it has
-	// no early-data key. Drain all leading 0x17 records with a short deadline;
-	// any non-0x17 record header is prepended back so nothing is lost.
+	// no early-data key. Drain all 0x17 records, keeping other records in prefix.
+	//
+	// Chrome's TLS 1.3 middlebox-compat mode inserts a CCS (0x14) record
+	// BETWEEN the ClientHello and the early data:
+	//   ClientHello → CCS(0x14) → early-data(0x17)...
+	// The old code broke out of the loop on 0x14, leaving the 0x17 records
+	// in the stream — Go's TLS would then see them and panic with "bad record MAC".
+	// Fix: always read the full body of every record; pass 0x14 through to prefix
+	// and continue the loop so trailing 0x17 records are still drained.
 	//
 	// IMPORTANT: io.ReadFull returns (n, err) where n may be > 0 even on error
 	// (e.g. a deadline timeout mid-read). Any partially-read bytes MUST be
-	// saved back to prefix; discarding them corrupts the TLS stream and causes
-	// "bad record MAC" or EOF errors in subsequent handshake processing.
+	// saved back to prefix; discarding them corrupts the TLS stream.
 	_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	for {
 		earlyHdr := make([]byte, 5)
@@ -83,11 +89,6 @@ func stripEarlyData(conn net.Conn) net.Conn {
 		if err != nil {
 			// Save any partial bytes so the TLS layer sees a complete stream.
 			prefix = append(prefix, earlyHdr[:n]...)
-			break
-		}
-		if earlyHdr[0] != 0x17 {
-			// Not an application-data record — put it back in the prefix
-			prefix = append(prefix, earlyHdr...)
 			break
 		}
 		earlyLen := int(binary.BigEndian.Uint16(earlyHdr[3:5]))
@@ -99,7 +100,19 @@ func stripEarlyData(conn net.Conn) net.Conn {
 			prefix = append(prefix, earlyBody[:n]...)
 			break
 		}
-		// discard early data record
+		if earlyHdr[0] == 0x17 {
+			// 0-RTT application data — discard.
+			continue
+		}
+		// Non-early-data record: always include the full record (header+body).
+		// CCS (0x14) precedes early data in compat mode — keep it and continue
+		// so we drain the 0x17 records that follow. Any other type ends the
+		// early-data window.
+		prefix = append(prefix, earlyHdr...)
+		prefix = append(prefix, earlyBody...)
+		if earlyHdr[0] != 0x14 {
+			break
+		}
 	}
 	_ = conn.SetReadDeadline(time.Time{}) // clear deadline
 
