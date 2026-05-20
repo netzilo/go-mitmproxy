@@ -71,11 +71,19 @@ func stripEarlyData(conn net.Conn) net.Conn {
 	// will see those 0x17 records and fail with "bad record MAC" because it has
 	// no early-data key. Drain all leading 0x17 records with a short deadline;
 	// any non-0x17 record header is prepended back so nothing is lost.
+	//
+	// IMPORTANT: io.ReadFull returns (n, err) where n may be > 0 even on error
+	// (e.g. a deadline timeout mid-read). Any partially-read bytes MUST be
+	// saved back to prefix; discarding them corrupts the TLS stream and causes
+	// "bad record MAC" or EOF errors in subsequent handshake processing.
 	_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	for {
 		earlyHdr := make([]byte, 5)
-		if _, err := io.ReadFull(conn, earlyHdr); err != nil {
-			break // timeout or EOF — no more early data
+		n, err := io.ReadFull(conn, earlyHdr)
+		if err != nil {
+			// Save any partial bytes so the TLS layer sees a complete stream.
+			prefix = append(prefix, earlyHdr[:n]...)
+			break
 		}
 		if earlyHdr[0] != 0x17 {
 			// Not an application-data record — put it back in the prefix
@@ -84,7 +92,11 @@ func stripEarlyData(conn net.Conn) net.Conn {
 		}
 		earlyLen := int(binary.BigEndian.Uint16(earlyHdr[3:5]))
 		earlyBody := make([]byte, earlyLen)
-		if _, err := io.ReadFull(conn, earlyBody); err != nil {
+		n, err = io.ReadFull(conn, earlyBody)
+		if err != nil {
+			// Couldn't read the full body; restore header + partial body.
+			prefix = append(prefix, earlyHdr...)
+			prefix = append(prefix, earlyBody[:n]...)
 			break
 		}
 		// discard early data record
