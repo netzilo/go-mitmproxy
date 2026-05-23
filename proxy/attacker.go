@@ -174,6 +174,16 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 						}
 						return conn, nil
 					},
+					// TLSClientConfig is required so cfg.NextProtos is non-empty when
+					// chromeTLSDial evaluates it on GOAWAY reconnects.  Without it,
+					// chromeTLSDial falls back to ["http/1.1"] and the upstream
+					// negotiates HTTP/1.1, breaking the http2.Transport session for
+					// all pending requests.
+					TLSClientConfig: &tls.Config{
+						InsecureSkipVerify: a.proxy.Opts.SslInsecure,
+						KeyLogWriter:       helper.GetTlsKeyLogWriter(),
+						NextProtos:         []string{"h2"},
+					},
 					DisableCompression:        true,
 					MaxHeaderListSize:         262144, // Chrome SETTINGS_MAX_HEADER_LIST_SIZE
 					MaxDecoderHeaderTableSize: 65536,  // Chrome SETTINGS_HEADER_TABLE_SIZE
