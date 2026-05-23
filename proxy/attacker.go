@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -21,17 +22,43 @@ import (
 
 type attackerListener struct {
 	connChan chan net.Conn
+	done     chan struct{}
+	once     sync.Once
 }
 
-func (l *attackerListener) accept(conn net.Conn) {
-	l.connChan <- conn
+func newAttackerListener() *attackerListener {
+	return &attackerListener{
+		connChan: make(chan net.Conn),
+		done:     make(chan struct{}),
+	}
+}
+
+// accept hands an intercepted client connection to the attacker's http.Server.
+// It returns false when the listener is already closed so the caller can drop
+// the connection instead of blocking forever.
+func (l *attackerListener) accept(conn net.Conn) bool {
+	select {
+	case l.connChan <- conn:
+		return true
+	case <-l.done:
+		return false
+	}
 }
 
 func (l *attackerListener) Accept() (net.Conn, error) {
-	c := <-l.connChan
-	return c, nil
+	select {
+	case c := <-l.connChan:
+		return c, nil
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
 }
-func (l *attackerListener) Close() error   { return nil }
+
+// Close unblocks Accept so http.Server.Serve returns; it is idempotent.
+func (l *attackerListener) Close() error {
+	l.once.Do(func() { close(l.done) })
+	return nil
+}
 func (l *attackerListener) Addr() net.Addr { return nil }
 
 type attackerConn struct {
@@ -96,9 +123,7 @@ func newAttacker(proxy *Proxy) (*attacker, error) {
 		ca:           ca,
 		client:       newUpstreamClient(true, false),
 		streamClient: newUpstreamClient(true, true),
-		listener: &attackerListener{
-			connChan: make(chan net.Conn),
-		},
+		listener:     newAttackerListener(),
 	}
 
 	a.server = &http.Server{
@@ -125,7 +150,24 @@ func newCa(opts *Options) (cert.CA, error) {
 }
 
 func (a *attacker) start() error {
-	return a.server.Serve(a.listener)
+	err := a.server.Serve(a.listener)
+	if err == http.ErrServerClosed || errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
+}
+
+// close stops the attacker's http.Server and unblocks its listener so the
+// Serve goroutine started by Proxy.Start exits.
+func (a *attacker) close() error {
+	a.listener.Close()
+	return a.server.Close()
+}
+
+// shutdown is the graceful variant of close.
+func (a *attacker) shutdown(ctx context.Context) error {
+	a.listener.Close()
+	return a.server.Shutdown(ctx)
 }
 
 func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
@@ -173,6 +215,16 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 							return nil, err
 						}
 						return conn, nil
+					},
+					// TLSClientConfig is required so cfg.NextProtos is non-empty when
+					// chromeTLSDial evaluates it on GOAWAY reconnects.  Without it,
+					// chromeTLSDial falls back to ["http/1.1"] and the upstream
+					// negotiates HTTP/1.1, breaking the http2.Transport session for
+					// all pending requests.
+					TLSClientConfig: &tls.Config{
+						InsecureSkipVerify: a.proxy.Opts.SslInsecure,
+						KeyLogWriter:       helper.GetTlsKeyLogWriter(),
+						NextProtos:         []string{"h2"},
 					},
 					DisableCompression:        true,
 					MaxHeaderListSize:         262144, // Chrome SETTINGS_MAX_HEADER_LIST_SIZE
@@ -304,10 +356,12 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 		return
 	}
 
-	a.listener.accept(&attackerConn{
+	if !a.listener.accept(&attackerConn{
 		Conn:    clientTlsConn,
 		connCtx: connCtx,
-	})
+	}) {
+		clientTlsConn.Close()
+	}
 }
 
 func (a *attacker) ServeHTTP(res http.ResponseWriter, req *http.Request) {

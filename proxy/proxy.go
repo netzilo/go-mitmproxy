@@ -83,12 +83,23 @@ func (proxy *Proxy) Start() error {
 	return proxy.entry.start()
 }
 
+// Close stops the entry server and the attacker server so no goroutine
+// started by Start outlives the proxy.
 func (proxy *Proxy) Close() error {
-	return proxy.entry.close()
+	err := proxy.entry.close()
+	if aErr := proxy.attacker.close(); err == nil {
+		err = aErr
+	}
+	return err
 }
 
+// Shutdown gracefully stops the entry server and the attacker server.
 func (proxy *Proxy) Shutdown(ctx context.Context) error {
-	return proxy.entry.shutdown(ctx)
+	err := proxy.entry.shutdown(ctx)
+	if aErr := proxy.attacker.shutdown(ctx); err == nil {
+		err = aErr
+	}
+	return err
 }
 
 func (proxy *Proxy) GetCertificate() x509.Certificate {

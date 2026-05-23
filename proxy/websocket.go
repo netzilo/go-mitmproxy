@@ -259,15 +259,19 @@ func (h *webSocketHandler) handleWSS(res http.ResponseWriter, req *http.Request)
 	}
 
 	// Forward original request headers to the upstream WebSocket server so that
-	// authentication (Authorization, Cookie, etc.) is preserved. Strip headers
-	// that the gorilla dialer adds automatically to avoid duplicates.
+	// authentication (Authorization, Cookie, etc.) and subprotocol negotiation
+	// are preserved. Strip only the headers that gorilla's Dialer generates
+	// itself to avoid duplicates. Note: Sec-WebSocket-Protocol is NOT stripped
+	// here because gorilla Dialer does NOT add it automatically — it must be
+	// forwarded explicitly so the server sees the subprotocol the client wants
+	// (e.g. "binary" for terminal emulators). Missing it causes immediate
+	// close 1006 from servers that require a specific subprotocol.
 	wsSkipHeaders := map[string]bool{
 		"Upgrade":                  true,
 		"Connection":               true,
 		"Sec-Websocket-Key":        true,
 		"Sec-Websocket-Version":    true,
 		"Sec-Websocket-Extensions": true,
-		"Sec-Websocket-Protocol":   true,
 	}
 	upstreamHeaders := make(http.Header)
 	for k, v := range req.Header {
@@ -290,7 +294,15 @@ func (h *webSocketHandler) handleWSS(res http.ResponseWriter, req *http.Request)
 		},
 	}
 
-	clientWS, err := upgrader.Upgrade(res, req, nil)
+	// Echo the subprotocol negotiated with the upstream server back to the
+	// client. Without this Chrome closes the connection if the server selected
+	// a specific subprotocol (e.g. "binary") that the client expects confirmed.
+	var upgradeResponseHeaders http.Header
+	if sub := serverWS.Subprotocol(); sub != "" {
+		upgradeResponseHeaders = http.Header{"Sec-Websocket-Protocol": {sub}}
+	}
+
+	clientWS, err := upgrader.Upgrade(res, req, upgradeResponseHeaders)
 	if err != nil {
 		log.Errorf("Failed to upgrade client connection: %v", err)
 		return err
