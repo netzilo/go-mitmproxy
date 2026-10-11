@@ -1150,6 +1150,8 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 	f := newFlow()
 	f.Request = newRequest(req)
 	f.ConnContext = req.Context().Value(connContextKey).(*ConnContext)
+	f.ConnContext.inFlight.Add(1)
+	defer f.ConnContext.inFlight.Add(-1)
 	defer f.finish()
 
 	f.ConnContext.FlowCount.Add(1)
@@ -1286,8 +1288,12 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if proxyRes.Close {
-		f.ConnContext.closeAfterResponse = true
+	// The upstream connection ends with this response when either side
+	// asked it to: the client hears so, and its connection is not cut
+	// while the response is still on its way.
+	if proxyRes.Close || req.Close {
+		f.ConnContext.closeAfterResponse.Store(true)
+		proxyRes.Close = true
 	}
 
 	defer proxyRes.Body.Close()

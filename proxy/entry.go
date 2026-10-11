@@ -128,7 +128,13 @@ func (c *wrapServerConn) Close() error {
 		// which reconnects via DialTLSContext/reconnectFn.  Closing the client
 		// connection here fires closeChan, cancels all stream contexts, and kills
 		// in-flight requests before reconnection can complete.
-		if !c.connCtx.closeAfterResponse && c.connCtx.ClientConn.NegotiatedProtocol != "h2" {
+		switch {
+		case c.connCtx.ClientConn.NegotiatedProtocol == "h2", c.connCtx.closeAfterResponse.Load():
+		case c.connCtx.inFlight.Load() > 0:
+			// A response is still being written to the client: the
+			// client connection closes after it, not under it.
+			c.connCtx.closeAfterResponse.Store(true)
+		default:
 			c.connCtx.ClientConn.Conn.Close()
 		}
 	}

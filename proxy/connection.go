@@ -81,9 +81,16 @@ type ConnContext struct {
 	Intercept  bool          `json:"intercept"` // Indicates whether to parse HTTPS
 	FlowCount  atomic.Uint32 `json:"-"`         // Number of HTTP requests made on the same connection
 
-	proxy              *Proxy
-	closeAfterResponse bool                        // after http response, http server will close the connection
-	dialFn             func(context.Context) error // when begin request, if there no ServerConn, use this func to dial
+	proxy *Proxy
+	// closeAfterResponse says the client connection closes once the
+	// response in flight is written (the upstream connection is gone or
+	// was asked to close); it is read by the server connection's Close on
+	// another goroutine, so it is atomic.
+	closeAfterResponse atomic.Bool
+	// inFlight counts the requests of this connection being answered: the
+	// client connection is never closed under one of them.
+	inFlight atomic.Int32
+	dialFn   func(context.Context) error // when begin request, if there no ServerConn, use this func to dial
 }
 
 func newConnContext(c net.Conn, proxy *Proxy) *ConnContext {
